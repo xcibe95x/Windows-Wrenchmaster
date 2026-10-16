@@ -58,6 +58,16 @@ impl Series {
         self.samples.len()
     }
 
+    /// Average the most recent samples once there is enough history to be useful.
+    pub fn recent_average(&self, max_samples: usize, minimum_samples: usize) -> Option<f32> {
+        let count = self.samples.len().min(max_samples);
+        if count < minimum_samples || count == 0 {
+            return None;
+        }
+        let total: f32 = self.samples.iter().rev().take(count).map(|s| s.value).sum();
+        Some(total / count as f32)
+    }
+
     #[allow(dead_code)] // kept for the next chart that needs it
     pub fn latest(&self) -> Option<f32> {
         self.samples.back().map(|s| s.value)
@@ -86,10 +96,7 @@ impl Series {
     /// Highest value in the series, for scaling an axis that is not a percentage.
     #[allow(dead_code)] // kept for the next chart that needs it
     pub fn peak(&self) -> f32 {
-        self.samples
-            .iter()
-            .map(|s| s.value)
-            .fold(0.0_f32, f32::max)
+        self.samples.iter().map(|s| s.value).fold(0.0_f32, f32::max)
     }
 }
 
@@ -97,6 +104,7 @@ impl Series {
 #[derive(Default)]
 pub struct History {
     pub cpu: Series,
+    pub gpu_load: Series,
     pub ram: Series,
     pub cpu_temp: Series,
     pub gpu_temp: Series,

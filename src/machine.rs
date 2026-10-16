@@ -119,6 +119,31 @@ pub enum ActivationStatus {
 
 static WINDOWS_ACTIVATION_STATUS: OnceLock<ActivationStatus> = OnceLock::new();
 
+fn drive_prefix(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| path[..2].to_ascii_uppercase())
+}
+
+/// The drive containing the active Windows installation, when it can be read.
+pub fn windows_system_drive_prefix() -> Option<String> {
+    ["SystemRoot", "WINDIR", "SystemDrive"]
+        .into_iter()
+        .find_map(|variable| {
+            std::env::var(variable)
+                .ok()
+                .and_then(|value| drive_prefix(&value))
+        })
+}
+
+/// Whether a volume mount belongs to the Windows installation drive.
+pub fn is_system_drive_mount(mount: &str) -> bool {
+    let Some(system_drive) = windows_system_drive_prefix() else {
+        return false;
+    };
+    drive_prefix(mount).is_some_and(|drive| drive == system_drive)
+}
+
 impl DiskInfo {
     pub fn used(&self) -> u64 {
         self.total.saturating_sub(self.available)
@@ -139,7 +164,6 @@ pub struct Machine {
     pub windows_build: String,
     pub windows_arch: String,
     pub host_name: String,
-    pub app_arch: String,
     pub cpu: String,
     pub cpu_cores: String,
     pub gpus: Vec<String>,
@@ -200,11 +224,6 @@ impl Machine {
                 Err(_) => "Unknown".into(),
             },
             host_name: sysinfo::System::host_name().unwrap_or_else(|| "this-pc".into()),
-            app_arch: if cfg!(target_pointer_width = "64") {
-                "64-bit".into()
-            } else {
-                "32-bit".into()
-            },
             cpu,
             cpu_cores,
             gpus: graphics_adapters(),

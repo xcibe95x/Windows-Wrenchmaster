@@ -1,6 +1,6 @@
 [package]
 name = "wrenchmaster"
-version = "1.9.9"
+version = "2.0.0"
 edition = "2024"
 description = "Windows Wrenchmaster - a modern, offline Windows maintenance toolbox"
 license = "MIT"
@@ -25,6 +25,11 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",
     "Win32_System_ProcessStatus",
 ] }
+
+# Windows resource metadata (icon, version, manifest). Build-time only, and
+# the build script skips it on any other target.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 2

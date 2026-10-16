@@ -11,7 +11,7 @@ use egui::{
     Align, Button, CentralPanel, Color32, Id, Label, Layout, Margin, Modal, Panel, RichText, Ui,
 };
 
-use crate::chrome;
+use crate::chrome::{self, Pointer};
 use crate::cleaner::{self, Measure, Progress};
 use crate::diagnose::{self, EventFinding, ScanResult as EventScanResult, ScanStatus};
 use crate::health::{self, Health};
@@ -25,35 +25,33 @@ use crate::network_watch::{
 use crate::ram::{self, MemorySnapshot, ProcessMemory};
 use crate::security_integrity;
 use crate::security_scan::{self, ScanReport};
-use crate::settings::Settings;
+use crate::settings::{Mode, Settings};
 use crate::theme::{self, ACCENT, FAINT, MUTED};
 use crate::tools::{self, Action};
 use crate::treesize::{self, ScanHandle, ScanMessage, ScanProgress, ScanResult};
 use crate::tweaks::{self, State, Tweak};
 use crate::util::{
-    human_bytes, is_development_mode, is_elevated, run_activation_scripts,
-    relaunch_elevated,
+    human_bytes, is_development_mode, is_elevated, relaunch_elevated, run_activation_scripts,
 };
 use crate::{app_residue, registry_audit, startup};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Overview,
+    Diagnose,
     SystemInfo,
     Hardware,
     Memory,
     Storage,
     Tweaks,
+    Security,
     Privacy,
     Troubleshoot,
-    Diagnose,
-    Security,
     Repair,
     Startup,
     Tools,
     Backup,
-    AiConnections,
-    About,
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,21 +83,83 @@ impl StorageView {
     }
 }
 
+/// Which of the three ways of naming an MCP server the settings page is
+/// showing.
+///
+/// Claude and OpenAI are not providers being called here; they are the two
+/// programs on this machine that already keep a list of local MCP servers.
+/// Custom is the pair of text fields this section used to be, and stays the
+/// answer whenever neither list has anything in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AiSource {
+    Claude,
+    OpenAi,
+    Custom,
+}
+
+/// The panes of the Settings page.
+///
+/// About used to be a tab of its own in the sidebar, which gave a version
+/// number and a three-line changelog the same standing as the cleaner. It is
+/// something you read once, so it belongs behind the same switcher as the
+/// rest of the things you set up once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsView {
+    Appearance,
+    Connections,
+    About,
+}
+
+impl SettingsView {
+    const ALL: [SettingsView; 3] = [
+        SettingsView::Appearance,
+        SettingsView::Connections,
+        SettingsView::About,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsView::Appearance => "Appearance",
+            SettingsView::Connections => "AI connection",
+            SettingsView::About => "About",
+        }
+    }
+}
+
+impl AiSource {
+    fn label(self) -> &'static str {
+        match self {
+            AiSource::Claude => "Claude",
+            AiSource::OpenAi => "OpenAI",
+            AiSource::Custom => "Custom",
+        }
+    }
+
+    /// The discovery source this choice lists, or `None` for Custom, which
+    /// lists nothing and asks instead.
+    fn discovery(self) -> Option<crate::ai_config::Source> {
+        match self {
+            AiSource::Claude => Some(crate::ai_config::Source::ClaudeDesktop),
+            AiSource::OpenAi => Some(crate::ai_config::Source::OpenAiCodex),
+            AiSource::Custom => None,
+        }
+    }
+}
+
 impl Tab {
-    const ALL: [Tab; 13] = [
+    const ALL: [Tab; 12] = [
         Tab::Overview,
-        Tab::SystemInfo,
+        Tab::Diagnose,
         Tab::Hardware,
         Tab::Memory,
         Tab::Storage,
         Tab::Tweaks,
-        Tab::Privacy,
-        Tab::Diagnose,
         Tab::Security,
+        Tab::Privacy,
         Tab::Tools,
         Tab::Backup,
-        Tab::AiConnections,
-        Tab::About,
+        Tab::SystemInfo,
+        Tab::Settings,
     ];
 
     /// Open straight onto a page, for looking at one while developing.
@@ -117,6 +177,7 @@ impl Tab {
     fn title(self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
+            Tab::Diagnose => "Diagnose",
             Tab::SystemInfo => "System Info",
             Tab::Hardware => "Hardware",
             Tab::Memory => "Memory",
@@ -124,40 +185,64 @@ impl Tab {
             Tab::Tweaks => "Tweaks",
             Tab::Privacy => "Privacy",
             Tab::Troubleshoot => "Troubleshoot",
-            Tab::Diagnose => "Diagnose",
             Tab::Security => "Security",
             Tab::Repair => "Repair",
             Tab::Startup => "Startup",
             Tab::Tools => "Tools",
             Tab::Backup => "Backup",
-            Tab::AiConnections => "AI Connections",
-            Tab::About => "About",
+            Tab::Settings => "Settings",
         }
     }
 
     fn blurb(self) -> &'static str {
         match self {
-            Tab::Overview => "A quick health check and the next useful action.",
+            Tab::Overview => "Current system health, performance, and space.",
+            Tab::Diagnose => {
+                "Read-only checks of load, memory, drives, devices and Windows events."
+            }
             Tab::SystemInfo => "Windows edition, activation, computer identity and uptime.",
             Tab::Hardware => "Processor, graphics and board, with live sensors where available.",
-            Tab::Memory => "Everything about RAM: live use, what is holding it, and how to free it.",
+            Tab::Memory => {
+                "Everything about RAM: live use, what is holding it, and how to free it."
+            }
             Tab::Storage => "Drives, cleanup, folder sizes and app leftovers.",
             Tab::Tweaks => "Registry switches, each one reversible from the same row.",
             Tab::Privacy => "Review privacy and Windows sharing controls one setting at a time.",
             Tab::Troubleshoot => "Windows diagnostics and guided troubleshooting options.",
-            Tab::Diagnose => "A health check of memory, drive space, uptime and cleanup.",
             Tab::Security => "Scan for threats and review Windows protection.",
             Tab::Repair => "Commands that change the system. Each one says what it does first.",
             Tab::Startup => "Review common startup entries and whether their commands resolve.",
             Tab::Tools => "Read-only places to look when something is wrong.",
             Tab::Backup => "Export the registry and drop a restore point before you tweak.",
-            Tab::AiConnections => {
-                "Connect a trusted local MCP server and inspect its available tools."
-            }
-            Tab::About => "Where this came from, and what changed.",
+            Tab::Settings => "Appearance, the AI server connection, and what this build is.",
         }
     }
 }
+
+/// Which long-running backup task is in flight.
+///
+/// Both of these used to run inline on the UI thread. A full `reg export` of
+/// HKLM takes thirty seconds to two minutes and `Checkpoint-Computer` takes
+/// twenty to ninety, so the window stopped painting, Windows greyed it out
+/// and marked it Not Responding, and the obvious move was to kill the app --
+/// in the middle of writing the registry backup the user had just asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupJob {
+    Export,
+    RestorePoint,
+}
+
+impl BackupJob {
+    fn running_text(self) -> &'static str {
+        match self {
+            BackupJob::Export => "Exporting the registry hives\u{2026}",
+            BackupJob::RestorePoint => "Creating a restore point\u{2026}",
+        }
+    }
+}
+
+/// Where the support button goes. The only URL the app contains.
+const PATREON_URL: &str = "https://www.patreon.com/aboveconstraints";
 
 struct Toast {
     text: String,
@@ -194,7 +279,10 @@ struct SensorQueryResult {
 pub struct App {
     tab: Tab,
     storage_view: StorageView,
+    settings_view: SettingsView,
     storage_expanded: bool,
+    hardware_expanded: bool,
+    security_expanded: bool,
     tools_expanded: bool,
     machine: Machine,
     machine_refreshed: Instant,
@@ -226,6 +314,10 @@ pub struct App {
     dry_run: bool,
     last_run_was_dry: bool,
     confirm_clean: bool,
+    /// A destructive repair waiting to be confirmed, and the activation
+    /// script if that is what is pending.
+    confirm_action: Option<Action>,
+    confirm_activation: bool,
     tweaks: Vec<Tweak>,
     troubleshooters: Vec<Action>,
     security_actions: Vec<Action>,
@@ -234,7 +326,9 @@ pub struct App {
     diagcabs: Vec<PathBuf>,
     token_scan_rx: Option<Receiver<ScanReport>>,
     token_scan_report: Option<ScanReport>,
-    diagnose_event_rx: Option<Receiver<EventScanResult>>,
+    diagnose_scan_rx: Option<Receiver<diagnose::CheckMessage>>,
+    diagnose_running_check: Option<diagnose::CheckId>,
+    diagnose_outcomes: Vec<diagnose::CheckOutcome>,
     diagnose_event_result: Option<EventScanResult>,
     app_residue_rx: Option<Receiver<app_residue::ScanResult>>,
     app_residue_result: Option<app_residue::ScanResult>,
@@ -255,15 +349,25 @@ pub struct App {
     network_scan_result: Option<NetworkScanResult>,
     elevated: bool,
     settings: Settings,
+    appearance: crate::appearance::Appearance,
+    health_cache_refreshed: Instant,
     accent: Color32,
     toast: Option<Toast>,
     backups: Vec<PathBuf>,
+    /// The running registry export or restore point, and which of the two it
+    /// is so the status line can name it.
+    backup_job: Option<(BackupJob, Receiver<Result<Vec<PathBuf>, String>>)>,
     mcp_program: String,
     mcp_args: String,
     mcp_connection: Option<crate::mcp_client::Connection>,
     mcp_status: String,
     mcp_server: Option<(String, String)>,
     mcp_tools: Vec<crate::mcp_client::ToolInfo>,
+    ai_source: AiSource,
+    /// Filled on the first frame the AI section is drawn and then kept,
+    /// because discovery reads two files off disk and the answer does not
+    /// change while the window is open.
+    ai_discovered: Option<Vec<crate::ai_config::Discovered>>,
 }
 
 impl App {
@@ -280,12 +384,14 @@ impl App {
         // Development override, so the light theme can be opened directly
         // without clicking the switch on every run.
         if crate::util::is_development_mode() && std::env::var("WRENCHMASTER_LIGHT").is_ok() {
-            settings.light = true;
+            settings.mode = Mode::Light;
         }
         chrome::install_fonts(&cc.egui_ctx);
         let [r, g, b] = machine.era.accent();
-        let accent = Color32::from_rgb(r, g, b);
-        theme::apply(&cc.egui_ctx, settings.light, accent);
+        let default_accent = Color32::from_rgb(r, g, b);
+        let appearance = crate::appearance::Appearance::load(default_accent);
+        let accent = appearance.accent();
+        appearance.apply(&cc.egui_ctx, &settings, accent);
 
         // Restore the target ticks the user left behind last time.
         let mut targets = cleaner::targets();
@@ -295,10 +401,13 @@ impl App {
             }
         }
 
-        Self {
+        let mut app = Self {
             tab: Tab::from_env().unwrap_or(Tab::Overview),
             storage_view: StorageView::from_env(),
+            settings_view: SettingsView::Appearance,
             storage_expanded: false,
+            hardware_expanded: false,
+            security_expanded: false,
             tools_expanded: false,
             machine,
             machine_refreshed: Instant::now(),
@@ -330,6 +439,8 @@ impl App {
             dry_run: settings.dry_run,
             last_run_was_dry: true,
             confirm_clean: false,
+            confirm_action: None,
+            confirm_activation: false,
             tweaks: tweaks::all(),
             troubleshooters: tools::troubleshooters(),
             security_actions: tools::security_actions(),
@@ -338,7 +449,9 @@ impl App {
             diagcabs: tools::local_diagcabs(),
             token_scan_rx: None,
             token_scan_report: None,
-            diagnose_event_rx: None,
+            diagnose_scan_rx: None,
+            diagnose_running_check: None,
+            diagnose_outcomes: Vec::new(),
             diagnose_event_result: None,
             app_residue_rx: None,
             app_residue_result: None,
@@ -359,16 +472,25 @@ impl App {
             network_scan_result: None,
             elevated: is_elevated(),
             settings,
+            appearance,
+            health_cache_refreshed: Instant::now(),
             accent,
             toast: None,
             backups: Vec::new(),
+            backup_job: None,
             mcp_program: String::new(),
             mcp_args: String::new(),
             mcp_connection: None,
             mcp_status: "Not connected".into(),
             mcp_server: None,
             mcp_tools: Vec::new(),
-        }
+            ai_source: AiSource::Claude,
+            ai_discovered: None,
+        };
+        // A passive CPU/RAM sample plus a bounded recent-event query. No
+        // stress workload, cleanup, or system changes run at startup.
+        app.start_diagnosis(false);
+        app
     }
 
     /// Mirror the live UI state into the preferences file.
@@ -564,6 +686,19 @@ impl App {
         for message in messages {
             match message {
                 ScanMessage::Progress(progress) => self.size_progress = progress,
+                // A tree built from what has been walked so far. Shown
+                // immediately: the folders already measured are useful
+                // before the rest arrive, and a scan of a whole drive is
+                // long enough that waiting for all of it feels broken.
+                // Folder indices are append-only across snapshots, so
+                // whatever the user has drilled into stays put.
+                ScanMessage::Partial(result) => {
+                    self.size_progress = result.progress.clone();
+                    if self.size_selected_folder >= result.folders.len() {
+                        self.size_selected_folder = 0;
+                    }
+                    self.size_result = Some(result);
+                }
                 ScanMessage::Finished(Ok(result)) => {
                     let status = if result.cancelled {
                         "Folder scan stopped"
@@ -629,35 +764,181 @@ impl App {
         }
     }
 
-    fn poll_diagnose_events(&mut self, ctx: &egui::Context) {
-        let received = self.diagnose_event_rx.as_ref().map(Receiver::try_recv);
-        match received {
-            Some(Ok(result)) => {
-                self.diagnose_event_rx = None;
-                self.diagnose_event_result = Some(result);
+    /// Hand a backup task to a worker and remember the channel.
+    ///
+    /// Both tasks report a `Vec<PathBuf>`; a restore point simply has no
+    /// files to report, which keeps one channel type for both rather than
+    /// two nearly identical ones.
+    fn start_backup_job(&mut self, job: BackupJob, directory: Option<PathBuf>) {
+        if self.backup_job.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = match job {
+                BackupJob::Export => match directory {
+                    Some(directory) => tools::export_registry(&directory),
+                    None => Err("No folder was chosen for the backup.".to_string()),
+                },
+                BackupJob::RestorePoint => tools::create_restore_point().map(|()| Vec::new()),
+            };
+            let _ = sender.send(outcome);
+        });
+        self.backup_job = Some((job, receiver));
+    }
+
+    fn poll_backup_job(&mut self, ctx: &egui::Context) {
+        let Some((job, receiver)) = &self.backup_job else {
+            return;
+        };
+        let job = *job;
+        match receiver.try_recv() {
+            Ok(Ok(files)) => {
+                self.backup_job = None;
+                match job {
+                    BackupJob::Export => {
+                        let count = files.len();
+                        self.backups = files;
+                        self.say(format!("Exported {count} hives."));
+                    }
+                    BackupJob::RestorePoint => self.say("Restore point created."),
+                }
             }
-            Some(Err(TryRecvError::Empty)) => {
+            Ok(Err(error)) => {
+                self.backup_job = None;
+                self.complain(error);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.backup_job = None;
+                self.complain("The backup task stopped without reporting a result.");
+            }
+            Err(TryRecvError::Empty) => {
                 ctx.request_repaint_after(Duration::from_millis(200));
             }
-            Some(Err(TryRecvError::Disconnected)) => {
-                self.diagnose_event_rx = None;
+        }
+    }
+
+    /// Drain everything the check worker has queued since the last frame.
+    ///
+    /// Drained into a local first because the handlers assign to fields of
+    /// `self`, which cannot be done while the receiver is still borrowed out
+    /// of it. A whole batch per frame is also the point: nine checks can
+    /// finish inside one repaint on a healthy machine.
+    fn poll_diagnose_events(&mut self, ctx: &egui::Context) {
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        let mut drained = false;
+        match self.diagnose_scan_rx.as_ref() {
+            Some(receiver) => loop {
+                match receiver.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(TryRecvError::Empty) => {
+                        drained = true;
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            },
+            None => return,
+        }
+
+        for message in messages {
+            match message {
+                diagnose::CheckMessage::Started(id) => self.diagnose_running_check = Some(id),
+                diagnose::CheckMessage::Events(result) => self.diagnose_event_result = Some(result),
+                diagnose::CheckMessage::Finished(outcome) => {
+                    self.diagnose_running_check = None;
+                    // Re-running the scan without clearing first would stack a
+                    // second row per check, so the old verdict is dropped.
+                    self.diagnose_outcomes
+                        .retain(|existing| existing.id != outcome.id);
+                    self.diagnose_outcomes.push(outcome);
+                }
+                diagnose::CheckMessage::AllDone => {
+                    self.diagnose_scan_rx = None;
+                    self.diagnose_running_check = None;
+                }
+            }
+        }
+
+        // The sender is dropped without an `AllDone` only if a check panicked
+        // or the thread could not start. The event panel is the one place the
+        // user would otherwise sit waiting on a spinner forever.
+        if disconnected && self.diagnose_scan_rx.is_some() {
+            self.diagnose_scan_rx = None;
+            self.diagnose_running_check = None;
+            if self.diagnose_event_result.is_none() {
                 self.diagnose_event_result = Some(EventScanResult {
-                    status: ScanStatus::Error(
-                        "The Windows event check stopped unexpectedly.".into(),
-                    ),
+                    status: ScanStatus::Error("The Windows checks stopped unexpectedly.".into()),
                     findings: Vec::new(),
                     log_errors: Vec::new(),
                 });
             }
-            None => {}
+        }
+        if drained && self.diagnose_scan_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
-    fn start_diagnosis(&mut self) {
+    /// Whether the event log check in particular has yet to report. The event
+    /// panel tracks this rather than the whole scan, because the slow checks
+    /// run after it and would otherwise keep the panel spinning over results
+    /// it already has.
+    fn diagnose_events_pending(&self) -> bool {
+        self.diagnose_scan_rx.is_some() && self.diagnose_event_result.is_none()
+    }
+
+    fn start_diagnosis(&mut self, notify: bool) {
         self.refresh_ram_data();
         self.diagnose_event_result = None;
-        self.diagnose_event_rx = Some(diagnose::start_scan());
-        self.say("Checking current resource pressure and recent Windows errors…");
+        self.diagnose_outcomes.clear();
+        self.diagnose_running_check = None;
+        self.diagnose_scan_rx = Some(diagnose::start_system_scan());
+        if notify {
+            self.say("Running the read-only machine checks…");
+        }
+    }
+
+    fn cache_health(&mut self, health: &Health) {
+        if health.mood == health::Mood::Checking
+            || self.settings.last_health_score == Some(health.score)
+        {
+            return;
+        }
+        if self.settings.last_health_score.is_none()
+            || self.health_cache_refreshed.elapsed() >= Duration::from_secs(30)
+        {
+            self.settings.last_health_score = Some(health.score);
+            self.settings.save();
+            self.health_cache_refreshed = Instant::now();
+        }
+    }
+
+    fn reliability_event_count(&self) -> Option<usize> {
+        let result = self.diagnose_event_result.as_ref()?;
+        if !matches!(&result.status, ScanStatus::Complete | ScanStatus::Partial) {
+            return None;
+        }
+        Some(
+            result
+                .findings
+                .iter()
+                .filter(|finding| {
+                    let source = finding.source.to_ascii_lowercase();
+                    source.contains("whea")
+                        || source.contains("disk")
+                        || source.contains("ntfs")
+                        || source.contains("resource-exhaustion")
+                        || source.contains("kernel-power")
+                        || source.contains("display")
+                        || source.contains("application error")
+                        || source.contains("windows error reporting")
+                })
+                .count(),
+        )
     }
 
     fn start_app_residue_scan(&mut self) {
@@ -851,6 +1132,23 @@ impl App {
         );
     }
 
+    /// Most recent GPU load value reported by LibreHardwareMonitor, if present.
+    fn sensor_gpu_load(&self) -> Option<f32> {
+        self.hardware_telemetry
+            .iter()
+            .filter(|reading| {
+                reading
+                    .hardware_type
+                    .to_ascii_lowercase()
+                    .starts_with("gpu")
+                    && reading.sensor_type.eq_ignore_ascii_case("Load")
+            })
+            .filter_map(|reading| reading.value.trim().parse::<f32>().ok())
+            .filter(|load| load.is_finite())
+            .map(|load| load.clamp(0.0, 100.0))
+            .max_by(f32::total_cmp)
+    }
+
     /// Why a temperature is missing, in terms the person can act on.
     ///
     /// LibreHardwareMonitor reads CPU core temperatures and motherboard
@@ -894,11 +1192,18 @@ impl App {
                 Some(best.map_or(v, |b| b.max(v)))
             })
     }
-
 }
 
 /// A time-series chart with a window selector. The selector sits with the
 /// chart rather than in a toolbar, because it only changes this chart.
+/// A time series card: the chart is the content, everything else is chrome
+/// around it.
+///
+/// The header carries the title on the left and the range switches on the
+/// right, the plot takes the full width of the card, and the key sits under
+/// it as dots. The plot library's own legend is off: it floats inside the
+/// data in a bordered box, which on a card like this reads as a second
+/// surface laid over the first.
 fn history_chart(
     ui: &mut Ui,
     window: &mut usize,
@@ -906,82 +1211,126 @@ fn history_chart(
     series: &[(&str, &crate::history::Series, Color32)],
     unit: &str,
 ) {
-    {
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(title).font(theme::section_title()).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(unit).small().color(MUTED));
-                    for (index, (label, _)) in History::WINDOWS.iter().enumerate().rev() {
-                        let selected = *window == index;
-                        if ui.selectable_label(selected, *label).clicked() {
-                            *window = index;
-                        }
+    let accent = theme::accent_on(ui, theme::ACCENT);
+    theme::widget(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.add(
+                Label::new(
+                    RichText::new(title)
+                        .font(theme::card_title())
+                        .strong()
+                        .color(theme::text(ui)),
+                )
+                .truncate(),
+            );
+            ui.add(Label::new(RichText::new(unit).font(theme::eyebrow()).color(MUTED)).truncate());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (index, (label, _)) in History::WINDOWS.iter().enumerate().rev() {
+                    if chrome::segment(ui, label, *window == index, accent)
+                        .pointer()
+                        .clicked()
+                    {
+                        *window = index;
                     }
-                });
+                }
             });
+        });
 
-            let (_, window_secs) = History::WINDOWS[(*window).min(2)];
-            if series.iter().all(|(_, s, _)| s.len() < 2) {
-                ui.add_space(theme::GAP);
-                ui.label(
-                    RichText::new("Collecting readings\u{2026}")
-                        .small()
-                        .color(MUTED),
-                );
-                ui.add_space(theme::GAP);
-                return;
-            }
+        let (_, window_secs) = History::WINDOWS[(*window).min(2)];
+        if series.iter().all(|(_, s, _)| s.len() < 2) {
+            ui.add_space(theme::GAP);
+            ui.label(
+                RichText::new("Collecting readings\u{2026}")
+                    .small()
+                    .color(MUTED),
+            );
+            ui.add_space(theme::GAP);
+            return;
+        }
 
-            egui_plot::Plot::new(format!("chart-{title}"))
-                .height(170.0)
-                .allow_drag(false)
-                .allow_zoom(false)
-                .allow_scroll(false)
-                .allow_boxed_zoom(false)
-                .show_axes([true, true])
-                // Let the card show through. The plot default paints
-                // extreme_bg_color, which is sized for a thin gauge track and
-                // reads as a heavy grey slab at chart size -- obvious on light.
-                .show_background(false)
-                // Both series are read as percentages or degrees on the same
-                // 0..100 scale, so pin it. A free axis rescales on every sample
-                // and makes a flat reading look like it is swinging.
-                .include_y(0.0)
-                .include_y(100.0)
-                .include_x(-window_secs as f64)
-                .include_x(0.0)
-                // The default grid draws a line per minor step, which at this
-                // size is a mesh rather than a reference.
-                .y_grid_spacer(egui_plot::uniform_grid_spacer(|_| [50.0, 25.0, 25.0]))
-                .x_grid_spacer(egui_plot::uniform_grid_spacer(move |_| {
-                    let step = (window_secs / 6.0).max(1.0) as f64;
-                    [step * 2.0, step, step]
-                }))
-                .x_axis_formatter(|mark, _| {
-                    let secs = -mark.value;
-                    if secs <= 0.5 {
-                        "now".to_owned()
-                    } else {
-                        format!("-{secs:.0}s")
-                    }
-                })
-                .legend(egui_plot::Legend::default().position(egui_plot::Corner::LeftTop))
-                .show(ui, |plot| {
-                    for (name, data, color) in series {
-                        let points = data.points(window_secs);
-                        if points.len() >= 2 {
-                            plot.line(
-                                egui_plot::Line::new(*name, egui_plot::PlotPoints::from(points))
-                                    .color(*color)
-                                    .width(1.4),
+        ui.add_space(theme::GAP);
+        egui_plot::Plot::new(format!("chart-{title}"))
+            .height(180.0)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
+            .allow_boxed_zoom(false)
+            .show_axes([false, true])
+            // Let the card show through. The plot default paints
+            // extreme_bg_color, which is sized for a thin gauge track and
+            // reads as a heavy grey slab at chart size -- obvious on light.
+            .show_background(false)
+            // The frame boxes the plot on all four sides. The card is already
+            // the boundary, so a second one just adds a line.
+            .show_grid([false, true])
+            // Both series are read as percentages or degrees on the same
+            // 0..100 scale, so pin it. A free axis rescales on every sample
+            // and makes a flat reading look like it is swinging.
+            .include_y(0.0)
+            .include_y(100.0)
+            .include_x(-window_secs as f64)
+            .include_x(0.0)
+            // The default grid draws a line per minor step, which at this
+            // size is a mesh rather than a reference.
+            .y_grid_spacer(egui_plot::uniform_grid_spacer(|_| [50.0, 25.0, 25.0]))
+            .x_grid_spacer(egui_plot::uniform_grid_spacer(move |_| {
+                let step = (window_secs / 6.0).max(1.0) as f64;
+                [step * 2.0, step, step]
+            }))
+            .x_axis_formatter(|mark, _| {
+                let secs = -mark.value;
+                if secs <= 0.5 {
+                    "now".to_owned()
+                } else {
+                    format!("-{secs:.0}s")
+                }
+            })
+            .y_axis_formatter(|mark, _| format!("{:.0}", mark.value))
+            .show(ui, |plot| {
+                for (name, data, color) in series {
+                    let points = data.points(window_secs);
+                    if points.len() >= 2 {
+                        // One series gets the wash under it; several would
+                        // overlap into mud, so those stay as lines.
+                        if series.len() == 1 {
+                            plot.polygon(
+                                egui_plot::Polygon::new(
+                                    *name,
+                                    egui_plot::PlotPoints::from(floor_under(&points)),
+                                )
+                                .fill_color(color.gamma_multiply(0.16))
+                                .stroke(egui::Stroke::NONE)
+                                .allow_hover(false),
                             );
                         }
+                        plot.line(
+                            egui_plot::Line::new(*name, egui_plot::PlotPoints::from(points))
+                                .color(*color)
+                                .width(1.8),
+                        );
                     }
-                });
-        });
-    }
+                }
+            });
+
+        ui.add_space(theme::GAP_TIGHT);
+        let key: Vec<(&str, Color32)> = series
+            .iter()
+            .map(|(name, _, color)| (*name, *color))
+            .collect();
+        chrome::legend(ui, &key);
+    });
+}
+
+/// Close a trace into a polygon by running back along the zero line, so the
+/// area under it can be filled.
+fn floor_under(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut shape = Vec::with_capacity(points.len() + 2);
+    shape.push([points[0][0], 0.0]);
+    shape.extend_from_slice(points);
+    shape.push([points[points.len() - 1][0], 0.0]);
+    shape
 }
 
 impl App {
@@ -995,7 +1344,11 @@ impl App {
             }
         }
         let texture = ui.ctx().load_texture(
-            if dark { "wordmark-dark" } else { "wordmark-light" },
+            if dark {
+                "wordmark-dark"
+            } else {
+                "wordmark-light"
+            },
             chrome::wordmark_image(dark),
             egui::TextureOptions::LINEAR,
         );
@@ -1013,11 +1366,18 @@ impl App {
             // a clock and the charts line up with each other.
             self.history.cpu.push(self.cpu_usage);
             self.history.ram.push(self.machine.ram_fraction() * 100.0);
+            if let Some(load) = self.sensor_gpu_load() {
+                self.history.gpu_load.push(load);
+            }
             if let Some(c) = self.sensor_temperature("Cpu") {
                 self.history.cpu_temp.push(c);
             }
             if let Some(c) = self.sensor_temperature("Gpu") {
                 self.history.gpu_temp.push(c);
+            }
+            if !self.settings.first_run_baseline_completed && self.history.cpu.len() >= 30 {
+                self.settings.first_run_baseline_completed = true;
+                self.settings.save();
             }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -1076,6 +1436,7 @@ impl eframe::App for App {
         self.poll_job(&ctx);
         self.poll_token_scan(&ctx);
         self.poll_diagnose_events(&ctx);
+        self.poll_backup_job(&ctx);
         self.poll_readonly_scans(&ctx);
         self.poll_security_integrity(&ctx);
         self.poll_size_scan(&ctx);
@@ -1088,22 +1449,25 @@ impl eframe::App for App {
             self.machine_refreshed = Instant::now();
         }
 
-        let close = Panel::top(Id::new("title-bar"))
+        let title_bar = Panel::top(Id::new("title-bar"))
             .exact_size(chrome::TITLE_BAR_HEIGHT)
             .resizable(false)
             .frame(theme::chrome(ui))
-            .show(ui, |ui| {
-                chrome::title_bar(ui, self.tab.title()).close_requested
-            })
+            .show(ui, |ui| chrome::title_bar(ui, self.elevated))
             .inner;
-        if close {
+        if title_bar.close_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if title_bar.elevation_requested {
+            self.elevate_now(&ctx);
         }
 
         self.sidebar(ui);
         self.status_bar(ui);
         self.body(ui);
         self.confirm_dialog(&ctx);
+        self.confirm_action_dialog(&ctx);
+        self.confirm_activation_dialog(&ctx);
         self.confirm_ram_trim_dialog(&ctx);
         self.confirm_ram_action_dialog(&ctx);
         chrome::resize_edges(ui);
@@ -1141,264 +1505,371 @@ impl App {
                     .max_height(list_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                for tab in Tab::ALL {
-                    let selected = self.tab == tab;
-                    if tab == Tab::Storage {
-                        // The row is the target: clicking it opens Storage and
-                        // opens its children; clicking it again folds them away.
-                        if chrome::nav_group(
-                            ui,
-                            selected && self.storage_view == StorageView::Summary,
-                            chrome::icon::STORAGE,
-                            "Storage",
-                            accent,
-                            self.storage_expanded,
-                        )
-                        .clicked()
-                        {
-                            if self.tab == Tab::Storage && self.storage_expanded {
-                                self.storage_expanded = false;
-                            } else {
-                                self.tab = Tab::Storage;
-                                self.storage_view = StorageView::Summary;
-                                self.storage_expanded = true;
+                        for tab in Tab::ALL {
+                            let selected = self.tab == tab;
+                            if tab == Tab::Memory {
+                                // Memory is a separate page under Hardware.
+                                continue;
                             }
-                        }
-
-                        let expansion = ui.ctx().animate_bool_with_time(
-                            Id::new("storage-cleanup-expansion"),
-                            self.storage_expanded,
-                            0.18,
-                        );
-                        if expansion > 0.001 {
-                            let clicked = ui
-                                .scope(|ui| {
-                                    ui.set_opacity(expansion);
-                                    ui.add_space(2.0);
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(32.0);
-                                        chrome::nav_item_with_height(
-                                            ui,
-                                            self.tab == Tab::Storage
-                                                && self.storage_view == StorageView::Cleanup,
-                                            chrome::icon::CLEANER,
-                                            "Cleanup",
-                                            accent,
-                                            32.0 * expansion,
-                                            expansion > 0.95,
-                                        )
-                                        .clicked()
-                                    })
-                                    .inner
-                                })
-                                .inner;
-                            if clicked {
-                                self.tab = Tab::Storage;
-                                self.storage_view = StorageView::Cleanup;
-                                self.storage_expanded = true;
-                            }
-
-                            let clicked = ui
-                                .scope(|ui| {
-                                    ui.set_opacity(expansion);
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(32.0);
-                                        chrome::nav_item_with_height(
-                                            ui,
-                                            self.tab == Tab::Storage
-                                                && self.storage_view == StorageView::SizeExplorer,
-                                            chrome::icon::CHART,
-                                            "Size Explorer",
-                                            accent,
-                                            32.0 * expansion,
-                                            expansion > 0.95,
-                                        )
-                                        .clicked()
-                                    })
-                                    .inner
-                                })
-                                .inner;
-                            if clicked {
-                                self.tab = Tab::Storage;
-                                self.storage_view = StorageView::SizeExplorer;
-                                self.storage_expanded = true;
-                            }
-
-                            let clicked = ui
-                                .scope(|ui| {
-                                    ui.set_opacity(expansion);
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(32.0);
-                                        chrome::nav_item_with_height(
-                                            ui,
-                                            self.tab == Tab::Storage
-                                                && self.storage_view == StorageView::AppLeftovers,
-                                            chrome::icon::APPS,
-                                            "App Leftovers",
-                                            accent,
-                                            32.0 * expansion,
-                                            expansion > 0.95,
-                                        )
-                                        .clicked()
-                                    })
-                                    .inner
-                                })
-                                .inner;
-                            if clicked {
-                                self.tab = Tab::Storage;
-                                self.storage_view = StorageView::AppLeftovers;
-                                self.storage_expanded = true;
-                            }
-                        }
-                        continue;
-                    }
-
-                    if tab == Tab::Tools {
-                        if chrome::nav_group(
-                            ui,
-                            self.tab == Tab::Tools,
-                            chrome::icon::TOOLS,
-                            "Tools",
-                            accent,
-                            self.tools_expanded,
-                        )
-                        .clicked()
-                        {
-                            if self.tab == Tab::Tools && self.tools_expanded {
-                                self.tools_expanded = false;
-                            } else {
-                                self.tab = Tab::Tools;
-                                self.tools_expanded = true;
-                            }
-                        }
-
-                        let expansion = ui.ctx().animate_bool_with_time(
-                            Id::new("tools-submenu-expansion"),
-                            self.tools_expanded,
-                            0.18,
-                        );
-                        if expansion > 0.001 {
-                            let mut selected_child = None;
-                            ui.scope(|ui| {
-                                ui.set_opacity(expansion);
-                                ui.add_space(2.0);
-                                ui.vertical(|ui| {
-                                    if ui
-                                        .horizontal(|ui| {
-                                            ui.add_space(32.0);
-                                            chrome::nav_item_with_height(
-                                                ui,
-                                                self.tab == Tab::Troubleshoot,
-                                                chrome::icon::TROUBLESHOOT,
-                                                "Troubleshoot",
-                                                accent,
-                                                32.0 * expansion,
-                                                expansion > 0.95,
-                                            )
-                                            .clicked()
-                                        })
-                                        .inner
-                                    {
-                                        selected_child = Some(Tab::Troubleshoot);
+                            if tab == Tab::Hardware {
+                                let in_group = matches!(self.tab, Tab::Hardware | Tab::Memory);
+                                if chrome::nav_group(
+                                    ui,
+                                    in_group,
+                                    chrome::icon::DEVICES,
+                                    "Hardware",
+                                    accent,
+                                    self.hardware_expanded,
+                                )
+                                .pointer()
+                                .clicked()
+                                {
+                                    if self.tab == Tab::Hardware && self.hardware_expanded {
+                                        self.hardware_expanded = false;
+                                    } else {
+                                        self.tab = Tab::Hardware;
+                                        self.hardware_expanded = true;
                                     }
-                                    if ui
-                                        .horizontal(|ui| {
-                                            ui.add_space(32.0);
-                                            chrome::nav_item_with_height(
-                                                ui,
-                                                self.tab == Tab::Repair,
-                                                chrome::icon::REPAIR,
-                                                "Repair",
-                                                accent,
-                                                32.0 * expansion,
-                                                expansion > 0.95,
-                                            )
-                                            .clicked()
+                                }
+
+                                let expansion = ui.ctx().animate_bool_with_time(
+                                    Id::new("hardware-submenu-expansion"),
+                                    self.hardware_expanded,
+                                    0.18,
+                                );
+                                if expansion > 0.001 {
+                                    let clicked = ui
+                                        .scope(|ui| {
+                                            ui.set_opacity(expansion);
+                                            ui.add_space(2.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(32.0);
+                                                chrome::nav_item_with_height(
+                                                    ui,
+                                                    self.tab == Tab::Memory,
+                                                    chrome::icon::MEMORY,
+                                                    "Memory",
+                                                    accent,
+                                                    32.0 * expansion,
+                                                    expansion > 0.95,
+                                                )
+                                                .pointer()
+                                                .clicked()
+                                            })
+                                            .inner
                                         })
-                                        .inner
-                                    {
-                                        selected_child = Some(Tab::Repair);
+                                        .inner;
+                                    if clicked {
+                                        self.tab = Tab::Memory;
+                                        self.hardware_expanded = true;
                                     }
-                                    if ui
-                                        .horizontal(|ui| {
-                                            ui.add_space(32.0);
-                                            chrome::nav_item_with_height(
-                                                ui,
-                                                self.tab == Tab::Startup,
-                                                chrome::icon::SCHEDULE,
-                                                "Startup",
-                                                accent,
-                                                32.0 * expansion,
-                                                expansion > 0.95,
-                                            )
-                                            .clicked()
+                                }
+                                continue;
+                            }
+                            if tab == Tab::Storage {
+                                // The row is the target: clicking it opens Storage and
+                                // opens its children; clicking it again folds them away.
+                                if chrome::nav_group(
+                                    ui,
+                                    selected && self.storage_view == StorageView::Summary,
+                                    chrome::icon::STORAGE,
+                                    "Storage",
+                                    accent,
+                                    self.storage_expanded,
+                                )
+                                .pointer()
+                                .clicked()
+                                {
+                                    if self.tab == Tab::Storage && self.storage_expanded {
+                                        self.storage_expanded = false;
+                                    } else {
+                                        self.tab = Tab::Storage;
+                                        self.storage_view = StorageView::Summary;
+                                        self.storage_expanded = true;
+                                    }
+                                }
+
+                                let expansion = ui.ctx().animate_bool_with_time(
+                                    Id::new("storage-cleanup-expansion"),
+                                    self.storage_expanded,
+                                    0.18,
+                                );
+                                if expansion > 0.001 {
+                                    let clicked = ui
+                                        .scope(|ui| {
+                                            ui.set_opacity(expansion);
+                                            ui.add_space(2.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(32.0);
+                                                chrome::nav_item_with_height(
+                                                    ui,
+                                                    self.tab == Tab::Storage
+                                                        && self.storage_view
+                                                            == StorageView::Cleanup,
+                                                    chrome::icon::CLEANER,
+                                                    "Cleanup",
+                                                    accent,
+                                                    32.0 * expansion,
+                                                    expansion > 0.95,
+                                                )
+                                                .pointer()
+                                                .clicked()
+                                            })
+                                            .inner
                                         })
-                                        .inner
-                                    {
-                                        selected_child = Some(Tab::Startup);
+                                        .inner;
+                                    if clicked {
+                                        self.tab = Tab::Storage;
+                                        self.storage_view = StorageView::Cleanup;
+                                        self.storage_expanded = true;
                                     }
-                                })
-                            });
-                            if let Some(child) = selected_child {
-                                self.tab = child;
-                                self.tools_expanded = true;
+
+                                    let clicked = ui
+                                        .scope(|ui| {
+                                            ui.set_opacity(expansion);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(32.0);
+                                                chrome::nav_item_with_height(
+                                                    ui,
+                                                    self.tab == Tab::Storage
+                                                        && self.storage_view
+                                                            == StorageView::SizeExplorer,
+                                                    chrome::icon::CHART,
+                                                    "Size Explorer",
+                                                    accent,
+                                                    32.0 * expansion,
+                                                    expansion > 0.95,
+                                                )
+                                                .pointer()
+                                                .clicked()
+                                            })
+                                            .inner
+                                        })
+                                        .inner;
+                                    if clicked {
+                                        self.tab = Tab::Storage;
+                                        self.storage_view = StorageView::SizeExplorer;
+                                        self.storage_expanded = true;
+                                    }
+
+                                    let clicked = ui
+                                        .scope(|ui| {
+                                            ui.set_opacity(expansion);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(32.0);
+                                                chrome::nav_item_with_height(
+                                                    ui,
+                                                    self.tab == Tab::Storage
+                                                        && self.storage_view
+                                                            == StorageView::AppLeftovers,
+                                                    chrome::icon::APPS,
+                                                    "App Leftovers",
+                                                    accent,
+                                                    32.0 * expansion,
+                                                    expansion > 0.95,
+                                                )
+                                                .pointer()
+                                                .clicked()
+                                            })
+                                            .inner
+                                        })
+                                        .inner;
+                                    if clicked {
+                                        self.tab = Tab::Storage;
+                                        self.storage_view = StorageView::AppLeftovers;
+                                        self.storage_expanded = true;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if tab == Tab::Privacy {
+                                // Privacy is a separate page under the Security group.
+                                continue;
+                            }
+
+                            if tab == Tab::Security {
+                                let in_group = matches!(self.tab, Tab::Security | Tab::Privacy);
+                                if chrome::nav_group(
+                                    ui,
+                                    in_group,
+                                    chrome::icon::SHIELD,
+                                    "Security",
+                                    accent,
+                                    self.security_expanded,
+                                )
+                                .pointer()
+                                .clicked()
+                                {
+                                    if self.tab == Tab::Security && self.security_expanded {
+                                        self.security_expanded = false;
+                                    } else {
+                                        self.tab = Tab::Security;
+                                        self.security_expanded = true;
+                                    }
+                                }
+
+                                let expansion = ui.ctx().animate_bool_with_time(
+                                    Id::new("security-submenu-expansion"),
+                                    self.security_expanded,
+                                    0.18,
+                                );
+                                if expansion > 0.001 {
+                                    let clicked = ui
+                                        .scope(|ui| {
+                                            ui.set_opacity(expansion);
+                                            ui.add_space(2.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(32.0);
+                                                chrome::nav_item_with_height(
+                                                    ui,
+                                                    self.tab == Tab::Privacy,
+                                                    chrome::icon::SHIELD,
+                                                    "Privacy",
+                                                    accent,
+                                                    32.0 * expansion,
+                                                    expansion > 0.95,
+                                                )
+                                                .pointer()
+                                                .clicked()
+                                            })
+                                            .inner
+                                        })
+                                        .inner;
+                                    if clicked {
+                                        self.tab = Tab::Privacy;
+                                        self.security_expanded = true;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if tab == Tab::Tools {
+                                if chrome::nav_group(
+                                    ui,
+                                    self.tab == Tab::Tools,
+                                    chrome::icon::TOOLS,
+                                    "Tools",
+                                    accent,
+                                    self.tools_expanded,
+                                )
+                                .pointer()
+                                .clicked()
+                                {
+                                    if self.tab == Tab::Tools && self.tools_expanded {
+                                        self.tools_expanded = false;
+                                    } else {
+                                        self.tab = Tab::Tools;
+                                        self.tools_expanded = true;
+                                    }
+                                }
+
+                                let expansion = ui.ctx().animate_bool_with_time(
+                                    Id::new("tools-submenu-expansion"),
+                                    self.tools_expanded,
+                                    0.18,
+                                );
+                                if expansion > 0.001 {
+                                    let mut selected_child = None;
+                                    ui.scope(|ui| {
+                                        ui.set_opacity(expansion);
+                                        ui.add_space(2.0);
+                                        ui.vertical(|ui| {
+                                            if ui
+                                                .horizontal(|ui| {
+                                                    ui.add_space(32.0);
+                                                    chrome::nav_item_with_height(
+                                                        ui,
+                                                        self.tab == Tab::Troubleshoot,
+                                                        chrome::icon::TROUBLESHOOT,
+                                                        "Troubleshoot",
+                                                        accent,
+                                                        32.0 * expansion,
+                                                        expansion > 0.95,
+                                                    )
+                                                    .pointer()
+                                                    .clicked()
+                                                })
+                                                .inner
+                                            {
+                                                selected_child = Some(Tab::Troubleshoot);
+                                            }
+                                            if ui
+                                                .horizontal(|ui| {
+                                                    ui.add_space(32.0);
+                                                    chrome::nav_item_with_height(
+                                                        ui,
+                                                        self.tab == Tab::Repair,
+                                                        chrome::icon::REPAIR,
+                                                        "Repair",
+                                                        accent,
+                                                        32.0 * expansion,
+                                                        expansion > 0.95,
+                                                    )
+                                                    .pointer()
+                                                    .clicked()
+                                                })
+                                                .inner
+                                            {
+                                                selected_child = Some(Tab::Repair);
+                                            }
+                                            if ui
+                                                .horizontal(|ui| {
+                                                    ui.add_space(32.0);
+                                                    chrome::nav_item_with_height(
+                                                        ui,
+                                                        self.tab == Tab::Startup,
+                                                        chrome::icon::SCHEDULE,
+                                                        "Startup",
+                                                        accent,
+                                                        32.0 * expansion,
+                                                        expansion > 0.95,
+                                                    )
+                                                    .pointer()
+                                                    .clicked()
+                                                })
+                                                .inner
+                                            {
+                                                selected_child = Some(Tab::Startup);
+                                            }
+                                        })
+                                    });
+                                    if let Some(child) = selected_child {
+                                        self.tab = child;
+                                        self.tools_expanded = true;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let glyph = match tab {
+                                Tab::Overview => chrome::icon::OVERVIEW,
+                                Tab::Diagnose => chrome::icon::DIAGNOSTICS,
+                                Tab::SystemInfo => chrome::icon::SYSTEM_INFO,
+                                Tab::Hardware => chrome::icon::DEVICES,
+                                Tab::Memory => unreachable!(),
+                                Tab::Storage => unreachable!(),
+                                Tab::Tweaks => chrome::icon::TWEAKS,
+                                Tab::Privacy => unreachable!(),
+                                Tab::Troubleshoot | Tab::Repair | Tab::Startup => unreachable!(),
+                                Tab::Security => chrome::icon::SHIELD,
+                                Tab::Tools => chrome::icon::TOOLS,
+                                Tab::Backup => chrome::icon::BACKUP,
+                                Tab::Settings => chrome::icon::SETTINGS,
+                            };
+                            if chrome::nav_item(ui, selected, glyph, tab.title(), accent)
+                                .pointer()
+                                .clicked()
+                            {
+                                self.tab = tab;
                             }
                         }
-                        continue;
-                    }
-
-                    let glyph = match tab {
-                        Tab::Overview => chrome::icon::OVERVIEW,
-                        Tab::SystemInfo => chrome::icon::SYSTEM_INFO,
-                        Tab::Hardware => chrome::icon::DEVICES,
-                        Tab::Memory => chrome::icon::MEMORY,
-                        Tab::Storage => unreachable!(),
-                        Tab::Tweaks => chrome::icon::TWEAKS,
-                        Tab::Privacy => chrome::icon::SHIELD,
-                        Tab::Troubleshoot | Tab::Repair | Tab::Startup => unreachable!(),
-                        Tab::Diagnose => chrome::icon::DIAGNOSTICS,
-                        Tab::Security => chrome::icon::SHIELD,
-                        Tab::Tools => chrome::icon::TOOLS,
-                        Tab::Backup => chrome::icon::BACKUP,
-                        Tab::AiConnections => chrome::icon::TOOLS,
-                        Tab::About => chrome::icon::ABOUT,
-                    };
-                    if chrome::nav_item(ui, selected, glyph, tab.title(), accent).clicked() {
-                        self.tab = tab;
-                    }
-                }
-
-                });
-
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    // Lift the switch off the window edge.
-                    ui.add_space(theme::GAP);
-                    let mut light = self.settings.light;
-                    ui.horizontal(|ui| {
-                        let glyph = if light {
-                            chrome::icon::SUN
-                        } else {
-                            chrome::icon::MOON
-                        };
-                        ui.label(chrome::icon_text(glyph, 14.0, MUTED));
-                        if chrome::toggle(ui, &mut light, accent).changed() {
-                            self.settings.light = light;
-                            self.settings.save();
-                            theme::apply(ui.ctx(), light, accent);
-                        }
-                        ui.label(
-                            RichText::new(if light { "Light" } else { "Dark" })
-                                .small()
-                                .color(MUTED),
-                        );
                     });
-                });
             });
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
         let accent = theme::accent_on(ui, self.accent);
-        let mut elevate = false;
         let frame = theme::chrome(ui).inner_margin(Margin::symmetric(14, 8));
         Panel::bottom(Id::new("status"))
             .exact_size(36.0)
@@ -1435,49 +1906,68 @@ impl App {
                         };
                         ui.label(RichText::new(&toast.text).color(color));
                     } else {
+                        // Set as a label rather than a sentence: this line
+                        // names the machine, it does not say anything about
+                        // it, and upper case is how the rest of the dashboard
+                        // marks a field name.
                         ui.label(
-                            RichText::new(format!(
-                                "{}  ·  {}  ·  up {}",
-                                self.machine.host_name,
-                                self.machine.windows_name,
-                                self.machine.uptime
-                            ))
+                            RichText::new(
+                                format!(
+                                    "{}  ·  {}  ·  up {}",
+                                    self.machine.host_name,
+                                    self.machine.windows_name,
+                                    self.machine.uptime
+                                )
+                                .to_uppercase(),
+                            )
+                            .small()
                             .color(MUTED),
                         );
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "RAM {}  ·  {}",
-                                human_bytes(self.machine.ram_used),
-                                self.machine.app_arch
-                            ))
-                            .font(theme::readout())
-                            .color(MUTED),
-                        );
-                        ui.label(RichText::new("·").small().color(MUTED));
-                        if self.elevated {
-                            ui.label(RichText::new("Administrator").small().color(theme::good(ui)));
-                        } else if ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new("Standard user").small().color(theme::warn(ui)),
-                                )
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text("Click to restart Wrenchmaster as administrator.")
+                        // The theme switch lives here now. It was a labelled
+                        // toggle pinned to the bottom of the sidebar, which
+                        // gave a once-a-month setting the same weight as the
+                        // navigation; the architecture it replaces was a
+                        // constant that never needed to be on screen.
+                        //
+                        // Custom is deliberately not in this rotation. It is a
+                        // palette assembled on the Settings page, and cycling
+                        // into it from here would repaint the window with
+                        // colours nobody asked for at that moment. While Custom
+                        // is active the button moves the base ramp it stands
+                        // on, so the switch still lightens and darkens the app
+                        // without throwing the palette away.
+                        let light = self.settings.light();
+                        let glyph = if light {
+                            chrome::icon::SUN
+                        } else {
+                            chrome::icon::MOON
+                        };
+                        let hover = match (self.settings.mode, light) {
+                            (Mode::Custom, true) => "Build Custom on the dark palette",
+                            (Mode::Custom, false) => "Build Custom on the light palette",
+                            (_, true) => "Switch to the dark theme",
+                            (_, false) => "Switch to the light theme",
+                        };
+                        if chrome::icon_button(ui, glyph, light, accent)
+                            .on_hover_text(hover)
+                            .pointer()
                             .clicked()
                         {
-                            elevate = true;
+                            self.settings.toggle_light();
+                            self.settings.save();
+                            self.appearance.apply(ui.ctx(), &self.settings, accent);
                         }
+                        ui.label(
+                            RichText::new(format!("RAM {}", human_bytes(self.machine.ram_used)))
+                                .font(theme::readout())
+                                .color(MUTED),
+                        );
                     });
                 });
             });
-        if elevate {
-            let ctx = ui.ctx().clone();
-            self.elevate_now(&ctx);
-        }
     }
 
     fn body(&mut self, ui: &mut Ui) {
@@ -1493,6 +1983,7 @@ impl App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
                     Tab::Overview => self.page_overview(ui),
+                    Tab::Diagnose => self.full_benchmark_panel(ui),
                     Tab::SystemInfo => self.page_system_info(ui),
                     Tab::Hardware => self.page_hardware(ui),
                     Tab::Memory => self.page_memory(ui),
@@ -1500,16 +1991,145 @@ impl App {
                     Tab::Tweaks => self.page_tweaks(ui),
                     Tab::Privacy => self.page_privacy(ui),
                     Tab::Troubleshoot => self.page_troubleshoot(ui),
-                    Tab::Diagnose => self.page_diagnose(ui),
                     Tab::Security => self.page_security(ui),
                     Tab::Repair => self.page_repair(ui),
                     Tab::Tools => self.page_tools(ui),
                     Tab::Startup => self.page_startup(ui),
                     Tab::Backup => self.page_backup(ui),
-                    Tab::AiConnections => self.page_ai_connections(ui),
-                    Tab::About => self.page_about(ui),
+                    Tab::Settings => self.page_settings(ui),
                 });
         });
+    }
+
+    /// Run an action, or hold it for confirmation if it is destructive.
+    ///
+    /// Every launch path goes through here so a new destructive action
+    /// cannot be added to the lists in `tools.rs` and quietly skip the
+    /// prompt by virtue of being called from a different page.
+    fn launch_action(&mut self, action: Action) {
+        if action.destructive {
+            self.confirm_action = Some(action);
+            return;
+        }
+        self.run_action_now(&action);
+    }
+
+    fn run_action_now(&mut self, action: &Action) {
+        match action.launch() {
+            Ok(()) => self.say(format!("Launched {}.", action.name)),
+            Err(error) => self.complain(format!("{}: {error}", action.name)),
+        }
+    }
+
+    /// The prompt for a repair that is awkward to undo.
+    ///
+    /// These used to run on a single click. Resetting the network stack from
+    /// a remote or VPN session drops the connection it was clicked over, and
+    /// there is no way back from the other end.
+    fn confirm_action_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.confirm_action.clone() else {
+            return;
+        };
+        let raw_accent = self.accent;
+        let mut go = false;
+        let mut cancel = false;
+
+        let response = Modal::new(Id::new("confirm-action")).show(ctx, |ui| {
+            let accent = theme::accent_on(ui, raw_accent);
+            ui.set_width(440.0);
+            ui.label(RichText::new(&action.name).heading());
+            ui.add_space(theme::GAP);
+            ui.add(Label::new(RichText::new(&action.what).color(MUTED)).wrap());
+            ui.add_space(theme::GAP);
+            ui.add(
+                Label::new(
+                    RichText::new(
+                        "This changes the system and is not undone by closing the window. A                          console opens so you can watch what it does.",
+                    )
+                    .small()
+                    .color(theme::warn(ui)),
+                )
+                .wrap(),
+            );
+            ui.add_space(theme::GAP_SECTION);
+            ui.horizontal(|ui| {
+                if chrome::button(ui, chrome::Weight::Danger, None, "Run it", accent).pointer().clicked() {
+                    go = true;
+                }
+                if chrome::button(ui, chrome::Weight::Ghost, None, "Cancel", accent).pointer().clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if go {
+            self.confirm_action = None;
+            self.run_action_now(&action);
+        } else if cancel || response.should_close() {
+            self.confirm_action = None;
+        }
+    }
+
+    /// The prompt for the activation scripts.
+    ///
+    /// This one gets its own wording rather than sharing the repair prompt,
+    /// because what it does is categorically different: it downloads a script
+    /// over the network and runs it with this process's rights. A dialog that
+    /// said only "this changes the system" would be underselling it.
+    fn confirm_activation_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_activation {
+            return;
+        }
+        let raw_accent = self.accent;
+        let mut go = false;
+        let mut cancel = false;
+
+        let response = Modal::new(Id::new("confirm-activation")).show(ctx, |ui| {
+            let accent = theme::accent_on(ui, raw_accent);
+            ui.set_width(460.0);
+            ui.label(RichText::new("Run the activation scripts?").heading());
+            ui.add_space(theme::GAP);
+            ui.add(
+                Label::new(RichText::new(
+                    "This downloads a script from get.activated.win and runs it with this                      program's rights. It is not part of Wrenchmaster and it is not the Windows                      activation settings page.",
+                ))
+                .wrap(),
+            );
+            ui.add_space(theme::GAP);
+            ui.add(
+                Label::new(
+                    RichText::new(
+                        "A console window opens with a menu to answer. Nothing happens until                          you choose something in it.",
+                    )
+                    .small()
+                    .color(MUTED),
+                )
+                .wrap(),
+            );
+            ui.add_space(theme::GAP_SECTION);
+            ui.horizontal(|ui| {
+                if chrome::button(ui, chrome::Weight::Danger, None, "Download and run", accent)
+                    .pointer().clicked()
+                {
+                    go = true;
+                }
+                if chrome::button(ui, chrome::Weight::Ghost, None, "Cancel", accent).pointer().clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if go {
+            self.confirm_activation = false;
+            match run_activation_scripts() {
+                Ok(()) => self.say("Opened the activation scripts in a console."),
+                Err(error) => {
+                    self.complain(format!("Could not start the activation scripts: {error}"))
+                }
+            }
+        } else if cancel || response.should_close() {
+            self.confirm_activation = false;
+        }
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
@@ -1533,18 +2153,22 @@ impl App {
                 total.files
             ));
             ui.add_space(theme::GAP);
-            ui.label(RichText::new("Files are deleted, not moved to the Recycle Bin.").color(theme::warn(ui)));
+            ui.label(
+                RichText::new("Files are deleted, not moved to the Recycle Bin.")
+                    .color(theme::warn(ui)),
+            );
             ui.add_space(theme::GAP_SECTION);
             ui.horizontal(|ui| {
                 if ui
                     .add(|ui: &mut Ui| {
                         chrome::button(ui, chrome::Weight::Danger, None, "Delete now", accent)
                     })
+                    .pointer()
                     .clicked()
                 {
                     go = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").pointer().clicked() {
                     cancel = true;
                 }
             });
@@ -1583,10 +2207,10 @@ impl App {
             );
             ui.add_space(theme::GAP_SECTION);
             ui.horizontal(|ui| {
-                if ui.button(RichText::new("Trim working set").strong()).clicked() {
+                if ui.button(RichText::new("Trim working set").strong()).pointer().clicked() {
                     trim = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").pointer().clicked() {
                     cancel = true;
                 }
             });
@@ -1648,10 +2272,10 @@ impl App {
             }
             ui.add_space(theme::GAP_SECTION);
             ui.horizontal(|ui| {
-                if ui.button(RichText::new("Run memory action").strong()).clicked() {
+                if ui.button(RichText::new("Run memory action").strong()).pointer().clicked() {
                     run = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").pointer().clicked() {
                     cancel = true;
                 }
             });
@@ -1681,70 +2305,119 @@ impl App {
             .iter()
             .any(|t| t.scan.is_some())
             .then_some(scanned.bytes);
-        let health = Health::assess(&self.machine, junk);
-        let mut scan = false;
-
+        let health = Health::assess(
+            &self.machine,
+            junk,
+            self.history.cpu.recent_average(30, 15),
+            self.history.gpu_load.recent_average(30, 15),
+            self.history.cpu_temp.recent_average(30, 15),
+            self.history.gpu_temp.recent_average(30, 15),
+            self.history.cpu.len(),
+            self.reliability_event_count(),
+        );
+        self.cache_health(&health);
+        let refresh_incomplete = health.mood == health::Mood::Checking;
+        let cached_score = self.settings.last_health_score;
+        let shown_score = if refresh_incomplete {
+            cached_score.map(|score| score.min(health.score))
+        } else {
+            Some(health.score)
+        };
+        let shown_mood = shown_score
+            .map(health::Mood::from_score)
+            .unwrap_or(health::Mood::Checking);
+        let leading_note = health.notes.iter().min_by_key(|note| match note.severity {
+            health::Severity::Bad => 0,
+            health::Severity::Warn => 1,
+            health::Severity::Info => 2,
+        });
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                health::face(ui, health.mood, 76.0);
+                let mood_color = shown_mood.color(ui);
+                match shown_score {
+                    Some(score) => {
+                        chrome::ring(
+                            ui,
+                            84.0,
+                            score as f32 / 100.0,
+                            mood_color,
+                            &score.to_string(),
+                            "of 100",
+                        );
+                    }
+                    None => {
+                        chrome::ring(ui, 84.0, 0.0, MUTED, "\u{2014}", "first check");
+                    }
+                }
                 ui.add_space(theme::GAP);
                 ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(health.score.to_string())
-                                .font(theme::readout_large())
-                                .color(health.mood.color(ui)),
-                        );
-                        ui.label(RichText::new("/ 100").color(MUTED));
-                    });
                     ui.label(
-                        RichText::new(health.mood.headline())
+                        RichText::new(shown_mood.headline())
                             .strong()
-                            .color(health.mood.color(ui)),
+                            .color(shown_mood.color(ui)),
                     );
                     ui.add_space(theme::GAP_TIGHT);
-                    for note in &health.notes {
+                    if refresh_incomplete && cached_score.is_none() {
                         ui.label(
-                            RichText::new(format!("• {}", note.text))
+                            RichText::new("Building the first health snapshot…")
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
+                    if let Some(note) = leading_note.filter(|note| {
+                        !refresh_incomplete || note.severity != health::Severity::Info
+                    }) {
+                        ui.label(
+                            RichText::new(&note.text)
                                 .small()
                                 .color(note.severity.color(ui)),
                         );
+                    } else if !refresh_incomplete {
+                        ui.label(
+                            RichText::new("No urgent issue detected in the latest check.")
+                                .small()
+                                .color(MUTED),
+                        );
                     }
-                    if junk.is_none() {
-                        ui.add_space(theme::GAP_TIGHT);
-                        if chrome::button(
-                            ui,
-                            chrome::Weight::Primary,
-                            None,
-                            "Measure cleanup space",
-                            accent,
-                        )
-                        .clicked()
-                        {
-                            scan = true;
+                    ui.add_space(theme::GAP_TIGHT);
+                    if chrome::button(
+                        ui,
+                        chrome::Weight::Primary,
+                        None,
+                        if self.diagnose_scan_rx.is_some() {
+                            "Show the machine checks"
+                        } else {
+                            "Run the machine checks"
+                        },
+                        accent,
+                    )
+                    .pointer()
+                    .clicked()
+                    {
+                        self.tab = Tab::Diagnose;
+                        if self.diagnose_scan_rx.is_none() {
+                            self.start_diagnosis(true);
                         }
                     }
                 });
+                // Centred against the row rather than top-aligned with it:
+                // the face has no baseline to share with the text, and
+                // hanging off the top of a card that grows with its notes
+                // left it drifting.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    health::face(ui, shown_mood, 68.0);
+                });
             });
         });
-        if scan {
-            self.tab = Tab::Storage;
-            self.storage_view = StorageView::Cleanup;
-            self.storage_expanded = true;
-            self.start_job(false);
-        }
-
         ui.add_space(theme::GAP_SECTION);
-        ui.label(
-            RichText::new("Right now")
-                .font(theme::section_title())
-                .strong(),
-        );
+        chrome::section_heading(ui, chrome::icon::CHART, "System at a glance", accent);
         ui.add_space(theme::GAP);
 
         let cpu = self.cpu_usage;
         let cpu_trend: Vec<f32> = self.history.cpu.values().collect();
+        let gpu = self.history.gpu_load.latest();
+        let gpu_trend: Vec<f32> = self.history.gpu_load.values().collect();
         let ram_trend: Vec<f32> = self.history.ram.values().collect();
         let self_cpu_threads = self.cpu_monitor.cpus().len();
         let ram_fraction = self.machine.ram_fraction();
@@ -1753,8 +2426,7 @@ impl App {
             .machine
             .disks
             .iter()
-            .find(|d| d.mount.starts_with("C:"))
-            .or_else(|| self.machine.disks.first())
+            .find(|disk| crate::machine::is_system_drive_mount(&disk.mount))
             .map(|d| {
                 (
                     d.mount.clone(),
@@ -1766,24 +2438,49 @@ impl App {
 
         let warn_now = theme::warn(ui);
         let bad_now = theme::bad(ui);
-        ui.columns(3, |columns| {
+        ui.columns(4, |columns| {
             let cpu_color = if cpu > 90.0 { warn_now } else { accent };
             reading_card(
                 &mut columns[0],
                 "Processor",
                 &format!("{cpu:.0}%"),
                 cpu_color,
+                if cpu > 90.0 { "High" } else { "Normal" },
                 cpu / 100.0,
                 &format!("{self_cpu_threads} threads"),
                 Some(&cpu_trend),
             );
 
-            let ram_color = if ram_fraction > 0.9 { bad_now } else { accent };
+            let gpu_value = gpu.map_or_else(|| "—".to_string(), |load| format!("{load:.0}%"));
+            let gpu_color = gpu.filter(|load| *load > 90.0).map_or(accent, |_| warn_now);
             reading_card(
                 &mut columns[1],
+                "Graphics",
+                &gpu_value,
+                if gpu.is_some() { gpu_color } else { MUTED },
+                if gpu.is_none() {
+                    "Unavailable"
+                } else if gpu.is_some_and(|load| load > 90.0) {
+                    "High"
+                } else {
+                    "Normal"
+                },
+                gpu.unwrap_or_default() / 100.0,
+                if gpu.is_some() {
+                    "GPU load"
+                } else {
+                    "Sensor unavailable"
+                },
+                Some(&gpu_trend),
+            );
+
+            let ram_color = if ram_fraction > 0.9 { bad_now } else { accent };
+            reading_card(
+                &mut columns[2],
                 "Memory",
                 &format!("{:.0}%", ram_fraction * 100.0),
                 ram_color,
+                if ram_fraction > 0.9 { "High" } else { "Normal" },
                 ram_fraction,
                 &ram_text,
                 Some(&ram_trend),
@@ -1793,78 +2490,29 @@ impl App {
                 // A drive does not move minute to minute, so it keeps the
                 // gauge: a flat sparkline would imply a reading that failed.
                 Some((mount, fraction, free, total)) => reading_card(
-                    &mut columns[2],
+                    &mut columns[3],
                     &format!("Drive {mount}"),
                     &format!("{:.0}%", fraction * 100.0),
                     if *fraction > 0.9 { bad_now } else { accent },
+                    if *fraction > 0.9 {
+                        "Low space"
+                    } else {
+                        "Available"
+                    },
                     *fraction,
                     &format!("{free} free of {total}"),
                     None,
                 ),
                 None => reading_card(
-                    &mut columns[2],
+                    &mut columns[3],
                     "Drive",
                     "--",
                     MUTED,
+                    "Unavailable",
                     0.0,
                     "No drive reported",
                     None,
                 ),
-            }
-        });
-
-        ui.add_space(theme::GAP_SECTION);
-        ui.label(RichText::new("Go to").font(theme::section_title()).strong());
-        ui.add_space(theme::GAP);
-        ui.columns(3, |columns| {
-            for (index, (title, detail, tab, glyph)) in [
-                (
-                    "System Info",
-                    "Windows and hardware",
-                    Tab::SystemInfo,
-                    chrome::icon::SYSTEM_INFO,
-                ),
-                (
-                    "Storage",
-                    "Memory and drive space",
-                    Tab::Storage,
-                    chrome::icon::STORAGE,
-                ),
-                (
-                    "Diagnose",
-                    "Review system health",
-                    Tab::Diagnose,
-                    chrome::icon::DIAGNOSTICS,
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                // The whole card is the target. A 60x22 "Open" button inside a
-                // 92px card was a small thing to hit sitting in a large empty
-                // one, which is the worst of both.
-                let card = theme::card(&columns[index])
-                    .show(&mut columns[index], |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(chrome::icon_text(glyph, 22.0, accent));
-                            ui.add_space(theme::GAP_TIGHT);
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(title).font(theme::card_title()).strong(),
-                                );
-                                ui.label(RichText::new(detail).small().color(MUTED));
-                            });
-                        });
-                    })
-                    .response
-                    .interact(egui::Sense::click());
-                if card.hovered() {
-                    columns[index].ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if card.clicked() {
-                    self.tab = tab;
-                }
             }
         });
     }
@@ -1902,7 +2550,7 @@ impl App {
                 });
                 if show_activation_button {
                     ui.add_space(theme::GAP_TIGHT);
-                    if ghost(ui, "Run activation scripts (downloads and runs MAS)").clicked() {
+                    if ghost(ui, "Run activation scripts (downloads and runs MAS)").pointer().clicked() {
                         open_activation_settings = true;
                     }
                 }
@@ -1933,15 +2581,7 @@ impl App {
         });
         ui.add_space(theme::GAP);
         if open_activation_settings {
-            match run_activation_scripts() {
-                Ok(()) => self.say("Started the Microsoft Activation Scripts."),
-                Err(error) => self.complain(format!("Could not start the activation scripts: {error}")),
-            }
-        }
-        if ghost(ui, "Refresh system information").clicked() {
-            self.machine = Machine::collect();
-            self.machine_refreshed = Instant::now();
-            self.say("System information refreshed.");
+            self.confirm_activation = true;
         }
     }
 
@@ -1949,10 +2589,7 @@ impl App {
         let m = &self.machine;
         let accent = theme::accent_on(ui, self.accent);
 
-        ui.horizontal(|ui| {
-            ui.label(chrome::icon_text(chrome::icon::DEVICES, 20.0, accent));
-            ui.label(RichText::new("Processor").font(theme::section_title()).strong());
-        });
+        chrome::section_heading(ui, chrome::icon::DEVICES, "Processor", accent);
         ui.add_space(theme::GAP);
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1962,7 +2599,11 @@ impl App {
             chrome::meter(
                 ui,
                 self.cpu_usage / 100.0,
-                if self.cpu_usage > 90.0 { theme::warn(ui) } else { accent },
+                if self.cpu_usage > 90.0 {
+                    theme::warn(ui)
+                } else {
+                    accent
+                },
                 Some(&format!("Overall load  {:.0}%", self.cpu_usage)),
             );
             let core_loads: Vec<f32> = self
@@ -1973,19 +2614,20 @@ impl App {
                 .collect();
             if !core_loads.is_empty() {
                 let warn_cores = theme::warn(ui);
-                ui.collapsing("Per logical processor", |ui| {
-                    ui.columns(4, |columns| {
-                        for (index, load) in core_loads.iter().enumerate() {
-                            let column = &mut columns[index % columns.len()];
-                            chrome::meter(
-                                column,
-                                *load / 100.0,
-                                if *load > 90.0 { warn_cores } else { accent },
-                                Some(&format!("Thread {}  {:.0}%", index + 1, load)),
-                            );
-                        }
+                let _ =
+                    chrome::accordion(ui, "cpu-per-thread", "Per logical processor", false, |ui| {
+                        ui.columns(4, |columns| {
+                            for (index, load) in core_loads.iter().enumerate() {
+                                let column = &mut columns[index % columns.len()];
+                                chrome::meter(
+                                    column,
+                                    *load / 100.0,
+                                    if *load > 90.0 { warn_cores } else { accent },
+                                    Some(&format!("Thread {}  {:.0}%", index + 1, load)),
+                                );
+                            }
+                        });
                     });
-                });
             }
             let readings = self
                 .hardware_telemetry
@@ -2000,11 +2642,13 @@ impl App {
                 );
                 if self.sensor_temperature("Cpu").is_none() {
                     ui.add_space(theme::GAP_TIGHT);
-                    ui.label(
-                        RichText::new(self.temperature_hint())
-                            .small()
-                            .color(if self.elevated { MUTED } else { theme::warn(ui) }),
-                    );
+                    ui.label(RichText::new(self.temperature_hint()).small().color(
+                        if self.elevated {
+                            MUTED
+                        } else {
+                            theme::warn(ui)
+                        },
+                    ));
                 }
             } else {
                 ui.label(
@@ -2020,28 +2664,39 @@ impl App {
             let cpu = std::mem::take(&mut self.history.cpu);
             let cpu_t = std::mem::take(&mut self.history.cpu_temp);
             let gpu_t = std::mem::take(&mut self.history.gpu_temp);
-            history_chart(
-                ui,
-                &mut self.chart_window,
-                "Load and temperature",
-                &[
-                    ("CPU load %", &cpu, theme::ACCENT),
-                    ("CPU \u{00b0}C", &cpu_t, theme::warn(ui)),
-                    ("GPU \u{00b0}C", &gpu_t, theme::good(ui)),
-                ],
-                "% and \u{00b0}C",
-            );
+            let load_color = theme::series(ui, 0);
+            let cpu_temp_color = theme::series(ui, 1);
+            let gpu_temp_color = theme::series(ui, 2);
+            ui.columns(2, |columns| {
+                history_chart(
+                    &mut columns[0],
+                    &mut self.chart_window,
+                    "Processor load",
+                    &[("CPU %", &cpu, load_color)],
+                    "%",
+                );
+                history_chart(
+                    &mut columns[1],
+                    &mut self.chart_window,
+                    "Temperatures",
+                    &[
+                        ("CPU \u{00b0}C", &cpu_t, cpu_temp_color),
+                        ("GPU \u{00b0}C", &gpu_t, gpu_temp_color),
+                    ],
+                    "\u{00b0}C",
+                );
+            });
             self.history.cpu = cpu;
             self.history.cpu_temp = cpu_t;
             self.history.gpu_temp = gpu_t;
         }
 
         ui.add_space(theme::GAP_SECTION);
-        ui.label(RichText::new("Graphics").font(theme::section_title()).strong());
+        chrome::section_heading(ui, chrome::icon::CHART, "Graphics", accent);
         ui.add_space(theme::GAP);
         if m.gpus.is_empty() {
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.label(RichText::new("No graphics adapters were reported.").color(MUTED));
             });
         }
@@ -2170,14 +2825,10 @@ impl App {
                 ui.label(chrome::icon_text(chrome::icon::MEMORY, 20.0, accent));
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Memory").strong());
-                    ui.label(
-                        RichText::new(m.ram_summary())
-                            .small()
-                            .color(MUTED),
-                    );
+                    ui.label(RichText::new(m.ram_summary()).small().color(MUTED));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ghost(ui, "Open Memory").clicked() {
+                    if ghost(ui, "Open Memory").pointer().clicked() {
                         open_memory = true;
                     }
                 });
@@ -2185,7 +2836,11 @@ impl App {
             chrome::meter(
                 ui,
                 m.ram_fraction(),
-                if m.ram_fraction() > 0.9 { theme::warn(ui) } else { accent },
+                if m.ram_fraction() > 0.9 {
+                    theme::warn(ui)
+                } else {
+                    accent
+                },
                 None,
             );
         });
@@ -2246,11 +2901,15 @@ impl App {
         });
 
         ui.add_space(theme::GAP);
-        ui.label(RichText::new("Storage volumes").font(theme::section_title()).strong());
+        ui.label(
+            RichText::new("Storage volumes")
+                .font(theme::section_title())
+                .strong(),
+        );
         ui.add_space(theme::GAP);
         if m.disks.is_empty() {
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.label(RichText::new("No mounted volumes were reported.").color(MUTED));
             });
         }
@@ -2266,7 +2925,7 @@ impl App {
                     });
                 });
                 ui.add_space(theme::GAP_TIGHT);
-                chrome::gauge(
+                chrome::meter(
                     ui,
                     fraction,
                     if fraction > 0.9 { theme::bad(ui) } else { accent },
@@ -2275,7 +2934,6 @@ impl App {
                         human_bytes(disk.available),
                         human_bytes(disk.total)
                     )),
-                    0.9,
                 );
                 ui.label(RichText::new("Mounted volume capacity; physical drive temperature and health are not available here.").small().color(MUTED));
             });
@@ -2302,7 +2960,7 @@ impl App {
                     })
                     .collect::<Vec<_>>();
                 theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width());
                     ui.label(RichText::new(&device).strong());
                     draw_hardware_sensor_rows(
                         ui,
@@ -2340,7 +2998,11 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(chrome::icon_text(chrome::icon::STORAGE, 20.0, accent));
-                ui.label(RichText::new("Drives").font(theme::section_title()).strong());
+                ui.label(
+                    RichText::new("Drives")
+                        .font(theme::section_title())
+                        .strong(),
+                );
             });
             ui.add_space(theme::GAP_TIGHT);
             if m.disks.is_empty() {
@@ -2354,16 +3016,19 @@ impl App {
                         ui.label(RichText::new(&disk.fs).small().color(MUTED))
                     });
                 });
-                chrome::gauge(
+                chrome::meter(
                     ui,
                     fraction,
-                    if fraction > 0.9 { theme::bad(ui) } else { accent },
+                    if fraction > 0.9 {
+                        theme::bad(ui)
+                    } else {
+                        accent
+                    },
                     Some(&format!(
                         "{} free of {}",
                         human_bytes(disk.available),
                         human_bytes(disk.total)
                     )),
-                    0.9,
                 );
                 ui.add_space(theme::GAP);
             }
@@ -2432,6 +3097,7 @@ impl App {
                     self.app_residue_rx.is_none(),
                     Button::new("Scan AppData folders"),
                 )
+                .pointer()
                 .clicked()
             {
                 self.start_app_residue_scan();
@@ -2441,6 +3107,7 @@ impl App {
                     self.registry_audit_rx.is_none(),
                     Button::new("Review uninstall records"),
                 )
+                .pointer()
                 .clicked()
             {
                 self.start_registry_audit();
@@ -2456,7 +3123,7 @@ impl App {
         if self.app_residue_rx.is_some() {
             ui.add_space(theme::GAP);
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Checking AppData folders…");
@@ -2467,7 +3134,7 @@ impl App {
             ui.add_space(theme::GAP);
             ui.label(RichText::new("Possible AppData folders").strong());
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.label(format!(
                     "{} folders reviewed · {} registered apps compared · {} unreadable entries",
                     report.folders_examined, report.registry_apps_seen, report.unreadable
@@ -2479,12 +3146,15 @@ impl App {
                     );
                 }
                 if report.findings.is_empty() {
-                    ui.label(RichText::new("No possible leftover folders were found.").color(theme::good(ui)));
+                    ui.label(
+                        RichText::new("No possible leftover folders were found.")
+                            .color(theme::good(ui)),
+                    );
                 }
             });
             for finding in &report.findings {
                 theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(chrome::icon_text(chrome::icon::FOLDER, 16.0, accent));
                         ui.vertical(|ui| {
@@ -2527,7 +3197,7 @@ impl App {
         if self.registry_audit_rx.is_some() {
             ui.add_space(theme::GAP);
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Reviewing uninstall records…");
@@ -2538,7 +3208,7 @@ impl App {
             ui.add_space(theme::GAP);
             ui.label(RichText::new("Possible stale uninstall records").strong());
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.label(format!(
                     "{} registry records checked · {} unreadable",
                     report.records_scanned, report.unreadable_records
@@ -2551,13 +3221,14 @@ impl App {
                 }
                 if report.candidates.is_empty() {
                     ui.label(
-                        RichText::new("No likely stale uninstall records were found.").color(theme::good(ui)),
+                        RichText::new("No likely stale uninstall records were found.")
+                            .color(theme::good(ui)),
                     );
                 }
             });
             for candidate in &report.candidates {
                 theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width());
                     ui.label(RichText::new(&candidate.display_name).strong());
                     ui.label(RichText::new(&candidate.key).small().monospace());
                     let hive = match candidate.source_hive {
@@ -2577,7 +3248,11 @@ impl App {
                     if let Some(publisher) = &candidate.publisher {
                         ui.label(RichText::new(publisher).small().color(MUTED));
                     }
-                    ui.label(RichText::new(&candidate.reason).small().color(theme::warn(ui)));
+                    ui.label(
+                        RichText::new(&candidate.reason)
+                            .small()
+                            .color(theme::warn(ui)),
+                    );
                     for evidence in &candidate.evidence {
                         ui.label(RichText::new(format!("• {evidence}")).small().color(MUTED));
                     }
@@ -2593,13 +3268,17 @@ impl App {
             ui.label(chrome::icon_text(chrome::icon::SCHEDULE, 20.0, accent));
             ui.label(RichText::new("Startup inventory").heading());
         });
-        para(ui, "Read common Run/RunOnce entries and Startup-folder shortcuts. Commands are inspected, never executed or changed.");
+        para(
+            ui,
+            "Read common Run/RunOnce entries and Startup-folder shortcuts. Commands are inspected, never executed or changed.",
+        );
         ui.add_space(theme::GAP);
         if ui
             .add_enabled(
                 self.startup_scan_rx.is_none(),
                 Button::new("Scan startup locations"),
             )
+            .pointer()
             .clicked()
         {
             self.start_startup_scan();
@@ -2607,7 +3286,7 @@ impl App {
         if self.startup_scan_rx.is_some() {
             ui.add_space(theme::GAP);
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Reading startup locations…");
@@ -2618,7 +3297,7 @@ impl App {
             if self.startup_scan_rx.is_none() {
                 ui.add_space(theme::GAP);
                 theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width());
                     ui.label("Review what may start with Windows");
                     ui.label(
                         RichText::new(
@@ -2647,7 +3326,8 @@ impl App {
             }
             if report.entries.is_empty() {
                 ui.label(
-                    RichText::new("No entries were found in the checked locations.").color(theme::good(ui)),
+                    RichText::new("No entries were found in the checked locations.")
+                        .color(theme::good(ui)),
                 );
             }
         });
@@ -2670,7 +3350,7 @@ impl App {
             };
             let resolved = entry.status == startup::ResolutionStatus::Resolved;
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(chrome::icon_text(
                         if resolved {
@@ -2679,14 +3359,22 @@ impl App {
                             chrome::icon::INFO
                         },
                         16.0,
-                        if resolved { theme::good(ui) } else { theme::warn(ui) },
+                        if resolved {
+                            theme::good(ui)
+                        } else {
+                            theme::warn(ui)
+                        },
                     ));
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&entry.display_name).strong());
                         ui.label(RichText::new(source).small().color(MUTED));
                         ui.label(RichText::new(&entry.command_or_path).small().monospace());
                         if !entry.resolution_note.is_empty() {
-                            ui.label(RichText::new(&entry.resolution_note).small().color(theme::warn(ui)));
+                            ui.label(
+                                RichText::new(&entry.resolution_note)
+                                    .small()
+                                    .color(theme::warn(ui)),
+                            );
                         }
                     });
                 });
@@ -2714,30 +3402,82 @@ impl App {
         let mut rescan = false;
         let mut cancel = false;
 
-        let started = busy || self.size_root.is_some();
-        ui.horizontal(|ui| {
-            if started
-                && ui
-                    .add_enabled(!busy, Button::new("Choose folder"))
-                    .clicked()
-            {
-                choose_folder = true;
-            }
-            if let Some(root) = &self.size_root {
+        // The drives, offered up front. Picking a folder through a file
+        // dialog is three clicks and a decision before anything happens, and
+        // the answer is almost always "the system drive" -- so the drives are
+        // on the page as one-click targets and the dialog stays for the case
+        // the chips do not cover.
+        let mut scan_drive: Option<PathBuf> = None;
+        theme::widget(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
                 ui.label(
-                    RichText::new(root.display().to_string())
-                        .small()
-                        .color(MUTED),
+                    RichText::new("DRIVES")
+                        .font(theme::eyebrow())
+                        .color(theme::muted(ui)),
                 );
-            }
-            if busy {
-                if ui.button("Stop scan").clicked() {
-                    cancel = true;
+                ui.add_space(theme::GAP_TIGHT);
+                for disk in &self.machine.disks {
+                    let selected = self
+                        .size_root
+                        .as_ref()
+                        .is_some_and(|root| root.as_os_str() == disk.mount.as_str());
+                    let used = disk.total.saturating_sub(disk.available);
+                    let label = format!(
+                        "{}  {} of {}",
+                        disk.mount.trim_end_matches('\\'),
+                        human_bytes(used),
+                        human_bytes(disk.total)
+                    );
+                    if chrome::segment(ui, &label, selected, accent)
+                        .pointer()
+                        .clicked()
+                        && !busy
+                    {
+                        scan_drive = Some(PathBuf::from(&disk.mount));
+                    }
                 }
-            } else if self.size_root.is_some() && ui.button("Scan again").clicked() {
-                rescan = true;
+                ui.add_space(theme::GAP_TIGHT);
+                if chrome::segment(ui, "Choose folder\u{2026}", false, accent)
+                    .pointer()
+                    .clicked()
+                    && !busy
+                {
+                    choose_folder = true;
+                }
+            });
+
+            if self.size_root.is_some() || busy {
+                ui.add_space(theme::GAP_TIGHT);
+                ui.horizontal(|ui| {
+                    if let Some(root) = &self.size_root {
+                        ui.add(
+                            Label::new(
+                                RichText::new(root.display().to_string())
+                                    .font(theme::readout())
+                                    .color(MUTED),
+                            )
+                            .truncate(),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if busy {
+                            if ghost(ui, "Stop scan").pointer().clicked() {
+                                cancel = true;
+                            }
+                        } else if self.size_root.is_some()
+                            && ghost(ui, "Scan again").pointer().clicked()
+                        {
+                            rescan = true;
+                        }
+                    });
+                });
             }
         });
+        if let Some(root) = scan_drive {
+            self.start_size_scan(root);
+        }
 
         if choose_folder {
             if let Some(root) = rfd::FileDialog::new().pick_folder() {
@@ -2757,18 +3497,32 @@ impl App {
 
         if busy {
             ui.add_space(theme::GAP);
-            theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            theme::widget(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!(
-                        "Reading {} entries · {} files · {}",
-                        self.size_progress.visited_entries,
-                        self.size_progress.files,
-                        human_bytes(self.size_progress.bytes)
-                    ));
+                    ui.add_space(theme::GAP_TIGHT);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} entries · {} files · {}",
+                            self.size_progress.visited_entries,
+                            self.size_progress.files,
+                            human_bytes(self.size_progress.bytes)
+                        ))
+                        .font(theme::readout()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // The table below is already filling in from partial
+                        // results, so this says what it is rather than
+                        // leaving the user wondering whether the numbers on
+                        // screen are the final ones.
+                        ui.label(
+                            RichText::new("Results so far · still scanning")
+                                .small()
+                                .color(MUTED),
+                        );
+                    });
                 });
-                ui.add(egui::ProgressBar::new(0.0).animate(true));
             });
         }
 
@@ -2797,7 +3551,7 @@ impl App {
                         "Choose folder",
                         accent,
                     )
-                    .clicked()
+                    .pointer().clicked()
                     {
                         choose_folder = true;
                     }
@@ -2851,31 +3605,45 @@ impl App {
                 );
             }
             if !result.errors.is_empty() {
-                ui.collapsing("Some locations could not be read", |ui| {
-                    for error in result.errors.iter().take(8) {
-                        ui.label(RichText::new(error).small().color(MUTED));
-                    }
-                    if result.omitted_errors > 0 {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} more access errors not shown.",
-                                result.omitted_errors
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                    }
-                });
+                let _ = chrome::accordion(
+                    ui,
+                    "treesize-read-errors",
+                    "Some locations could not be read",
+                    false,
+                    |ui| {
+                        for error in result.errors.iter().take(8) {
+                            ui.label(RichText::new(error).small().color(MUTED));
+                        }
+                        if result.omitted_errors > 0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} more access errors not shown.",
+                                    result.omitted_errors
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                        }
+                    },
+                );
             }
         });
 
         ui.add_space(theme::GAP);
         let mut show_files = self.size_show_files;
         ui.horizontal(|ui| {
-            if ui.selectable_label(!show_files, "Folders").clicked() {
+            if ui
+                .selectable_label(!show_files, "Folders")
+                .pointer()
+                .clicked()
+            {
                 show_files = false;
             }
-            if ui.selectable_label(show_files, "Largest files").clicked() {
+            if ui
+                .selectable_label(show_files, "Largest files")
+                .pointer()
+                .clicked()
+            {
                 show_files = true;
             }
             ui.label(
@@ -2953,7 +3721,7 @@ impl App {
                         let label = &result.folders[*index].name;
                         if *index == selected_folder {
                             ui.label(RichText::new(label).strong());
-                        } else if ghost(ui, label).clicked() {
+                        } else if ghost(ui, label).pointer().clicked() {
                             navigate_to = Some(*index);
                         }
                     }
@@ -3000,25 +3768,54 @@ impl App {
                                 egui::FontId::proportional(16.0),
                                 self.accent,
                             );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 27.0, row_rect.center().y - 6.0),
-                                egui::Align2::LEFT_CENTER,
-                                &folder.name,
+                            // The size is laid out first so the name knows
+                            // how much room is left. Painted blind, a long
+                            // folder name ran straight under the figure and
+                            // off the end of the row -- the painter clips
+                            // nothing, and the row has no idea the text is
+                            // there.
+                            let size_text = painter.layout_no_wrap(
+                                format!(
+                                    "{}  \u{00b7}  {:.1}%",
+                                    human_bytes(folder.bytes),
+                                    percent
+                                ),
+                                egui::FontId::proportional(13.0),
+                                MUTED,
+                            );
+                            let name_room = (row_rect.width()
+                                - 27.0
+                                - 6.0
+                                - size_text.size().x
+                                - 12.0)
+                                .max(40.0);
+                            let name = painter.layout(
+                                folder.name.clone(),
                                 egui::FontId::proportional(14.0),
                                 theme::text(ui),
+                                name_room,
                             );
-                            painter.text(
-                                egui::pos2(row_rect.right() - 6.0, row_rect.center().y - 6.0),
-                                egui::Align2::RIGHT_CENTER,
-                                format!("{}  ·  {:.1}%", human_bytes(folder.bytes), percent),
-                                egui::FontId::proportional(13.0),
+                            painter.galley(
+                                egui::pos2(
+                                    row_rect.left() + 27.0,
+                                    row_rect.center().y - 6.0 - name.size().y * 0.5,
+                                ),
+                                name,
+                                theme::text(ui),
+                            );
+                            painter.galley(
+                                egui::pos2(
+                                    row_rect.right() - 6.0 - size_text.size().x,
+                                    row_rect.center().y - 6.0 - size_text.size().y * 0.5,
+                                ),
+                                size_text,
                                 MUTED,
                             );
                             let bar = egui::Rect::from_min_max(
                                 egui::pos2(row_rect.left() + 27.0, row_rect.bottom() - 5.0),
                                 egui::pos2(row_rect.right() - 6.0, row_rect.bottom() - 2.0),
                             );
-                            painter.rect_filled(bar, 2.0, ui.visuals().faint_bg_color);
+                            painter.rect_filled(bar, 2.0, theme::track(ui));
                             let filled = egui::Rect::from_min_max(
                                 bar.min,
                                 egui::pos2(
@@ -3027,7 +3824,7 @@ impl App {
                                 ),
                             );
                             painter.rect_filled(filled, 2.0, self.accent);
-                            let should_navigate = response.clicked() || response.double_clicked();
+                            let should_navigate = response.pointer().clicked() || response.pointer().double_clicked();
                             response.on_hover_text(format!(
                                 "{}\n{} files · {} subfolders\nClick to open",
                                 folder.path.display(),
@@ -3051,26 +3848,118 @@ impl App {
 
     /// Everything about RAM in one place: how much is in use right now, what is
     /// holding it, and the actions that give it back. These three used to live
-    /// on three unrelated pages -- Hardware, Diagnose and Storage > Cleanup --
+    /// on three unrelated pages -- Hardware, Overview's benchmark and Storage > Cleanup --
     /// which meant three hops to answer one question.
     fn page_memory(&mut self, ui: &mut Ui) {
         let accent = theme::accent_on(ui, self.accent);
-        {
-            let m = &self.machine;
-            theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(chrome::icon_text(chrome::icon::MEMORY, 20.0, accent));
-                    ui.label(RichText::new("In use now").font(theme::section_title()).strong());
-                });
-                ui.add_space(theme::GAP_TIGHT);
-                chrome::gauge(
-                    ui,
-                    m.ram_fraction(),
-                    if m.ram_fraction() > 0.9 { theme::bad(ui) } else { accent },
-                    Some(&m.ram_summary()),
-                    0.9,
+        let snapshot = self.ram_snapshot;
+        let total = snapshot.map_or(self.machine.ram_total, |memory| memory.physical_total_bytes);
+        let available = snapshot.map_or_else(
+            || self.machine.ram_total.saturating_sub(self.machine.ram_used),
+            |memory| {
+                memory
+                    .physical_available_bytes
+                    .min(memory.physical_total_bytes)
+            },
+        );
+        let used = total.saturating_sub(available);
+        let used_fraction = if total == 0 {
+            0.0
+        } else {
+            used as f32 / total as f32
+        };
+        let used_color = if used_fraction > 0.95 {
+            theme::bad(ui)
+        } else if used_fraction > 0.85 {
+            theme::warn(ui)
+        } else {
+            accent
+        };
+        let available_color = if available < total / 10 {
+            theme::warn(ui)
+        } else {
+            theme::good(ui)
+        };
+        let commit_fraction = snapshot.map(|memory| {
+            (memory.commit_used_bytes as f32 / memory.commit_limit_bytes.max(1) as f32)
+                .clamp(0.0, 1.0)
+        });
+        let commit_color = if commit_fraction.is_some_and(|fraction| fraction > 0.9) {
+            theme::warn(ui)
+        } else if commit_fraction.is_some() {
+            accent
+        } else {
+            MUTED
+        };
+        chrome::section_heading(ui, chrome::icon::MEMORY, "Memory overview", accent);
+        ui.add_space(theme::GAP);
+        ui.columns(3, |columns| {
+            metric_widget(
+                &mut columns[0],
+                chrome::icon::MEMORY,
+                "In use",
+                &format!("{:.0}%", used_fraction * 100.0),
+                if used_fraction > 0.95 {
+                    "Very high"
+                } else if used_fraction > 0.85 {
+                    "High"
+                } else {
+                    "Normal"
+                },
+                &format!("{} of {}", human_bytes(used), human_bytes(total)),
+                Some(used_fraction),
+                used_color,
+            );
+            metric_widget(
+                &mut columns[1],
+                chrome::icon::CHART,
+                "Available",
+                &human_bytes(available),
+                if available < total / 10 {
+                    "Limited"
+                } else {
+                    "Ready"
+                },
+                "Physical memory Windows can use now",
+                None,
+                available_color,
+            );
+            if let Some(memory) = snapshot {
+                let fraction = commit_fraction.unwrap_or_default();
+                metric_widget(
+                    &mut columns[2],
+                    chrome::icon::CHART,
+                    "Committed",
+                    &format!("{:.0}%", fraction * 100.0),
+                    if fraction > 0.9 { "High" } else { "Normal" },
+                    &format!(
+                        "{} of {} · RAM or page file",
+                        human_bytes(memory.commit_used_bytes),
+                        human_bytes(memory.commit_limit_bytes)
+                    ),
+                    Some(fraction),
+                    commit_color,
                 );
+            } else {
+                metric_widget(
+                    &mut columns[2],
+                    chrome::icon::CHART,
+                    "Committed",
+                    "—",
+                    "Unavailable",
+                    "Windows memory counters are unavailable",
+                    None,
+                    MUTED,
+                );
+            }
+        });
+
+        let _ = chrome::accordion(
+            ui,
+            "memory-temp-sensors",
+            "Memory temperature sensors",
+            false,
+            |ui| {
                 let readings = self
                     .hardware_telemetry
                     .iter()
@@ -3089,8 +3978,8 @@ impl App {
                             .color(MUTED),
                     );
                 }
-            });
-        }
+            },
+        );
 
         ui.add_space(theme::GAP);
         {
@@ -3099,7 +3988,7 @@ impl App {
                 ui,
                 &mut self.chart_window,
                 "Memory over time",
-                &[("RAM %", &ram, theme::ACCENT)],
+                &[("RAM %", &ram, theme::series(ui, 0))],
                 "%",
             );
             self.history.ram = ram;
@@ -3114,8 +4003,12 @@ impl App {
     fn page_ram_diagnostic(&mut self, ui: &mut Ui) {
         let mut refresh = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("What is holding it").font(theme::section_title()).strong());
-            if ghost(ui, "Refresh").clicked() {
+            ui.label(
+                RichText::new("What is holding it")
+                    .font(theme::section_title())
+                    .strong(),
+            );
+            if ghost(ui, "Refresh").pointer().clicked() {
                 refresh = true;
             }
         });
@@ -3131,24 +4024,67 @@ impl App {
                 let available = snapshot.physical_available_bytes.min(total);
                 let in_use = total.saturating_sub(available);
                 ui.label(RichText::new("Physical memory").strong());
-                let in_use_fraction = if total == 0 {
+                // Kernel and drivers are part of what is in use but are not
+                // something you can close, so they are split out rather than
+                // lumped in with the applications. The rest of the bar is
+                // what is actually free to hand out.
+                let kernel = snapshot
+                    .kernel_paged_bytes
+                    .saturating_add(snapshot.kernel_nonpaged_bytes)
+                    .min(in_use);
+                let apps = in_use.saturating_sub(kernel);
+                let pressure = if total == 0 {
                     0.0
                 } else {
-                    in_use as f32 / total as f32
+                    in_use as f64 / total as f64
                 };
-                chrome::meter(
+                let apps_color = if pressure > 0.9 {
+                    theme::warn(ui)
+                } else {
+                    theme::series(ui, 0)
+                };
+                let kernel_color = theme::series(ui, 1);
+                let free_color = theme::track(ui);
+                ui.add_space(theme::GAP_TIGHT);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        Label::new(
+                            RichText::new(format!(
+                                "{} in use of {}",
+                                human_bytes(in_use),
+                                human_bytes(total)
+                            ))
+                            .font(theme::readout())
+                            .color(MUTED),
+                        )
+                        .truncate(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{:.0}%", pressure * 100.0))
+                                .font(theme::readout())
+                                .color(apps_color),
+                        );
+                    });
+                });
+                ui.add_space(theme::GAP_TIGHT);
+                chrome::stack(
                     ui,
-                    in_use_fraction,
-                    if total > 0 && in_use as f64 / total as f64 > 0.9 {
-                        theme::warn(ui)
-                    } else {
-                        self.accent
-                    },
-                    Some(&format!(
-                        "{} in use of {}",
-                        human_bytes(in_use),
-                        human_bytes(total)
-                    )),
+                    &[
+                        (apps as f32, apps_color),
+                        (kernel as f32, kernel_color),
+                        (available as f32, free_color),
+                    ],
+                    14.0,
+                );
+                ui.add_space(theme::GAP_TIGHT);
+                chrome::legend(
+                    ui,
+                    &[
+                        ("Applications", apps_color),
+                        ("Kernel and drivers", kernel_color),
+                        ("Available", free_color),
+                    ],
                 );
 
                 ui.add_space(theme::GAP);
@@ -3240,7 +4176,7 @@ impl App {
             }
 
             ui.add_space(theme::GAP);
-            if ui.button("Test RAM after restart").clicked() {
+            if ui.button("Test RAM after restart").pointer().clicked() {
                 match crate::util::spawn("mdsched.exe", &[]) {
                     Ok(()) => self.say(
                         "Windows Memory Diagnostic opened. The test runs after you restart.",
@@ -3254,7 +4190,11 @@ impl App {
     }
 
     fn page_ram_cleanup(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("Free memory").font(theme::section_title()).strong());
+        ui.label(
+            RichText::new("Free memory")
+                .font(theme::section_title())
+                .strong(),
+        );
         ui.add_space(theme::GAP_TIGHT);
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -3284,7 +4224,7 @@ impl App {
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Trim").clicked() {
+                        if ui.button("Trim").pointer().clicked() {
                             selected = Some(process.clone());
                         }
                         ui.label(human_bytes(process.working_set_bytes));
@@ -3317,7 +4257,7 @@ impl App {
             ui.add_space(theme::GAP);
             for action in actions {
                 ui.horizontal(|ui| {
-                    if ui.button(action.title()).clicked() {
+                    if ui.button(action.title()).pointer().clicked() {
                         requested_action = Some(action);
                     }
                     ui.label(RichText::new(action.explanation()).small().color(MUTED));
@@ -3343,15 +4283,10 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!busy, |ui| {
-                    if chrome::button(
-                        ui,
-                        chrome::Weight::Primary,
-                        None,
-                        "Scan selected",
-                        accent,
-                    )
-                    .on_hover_text("Measures without touching anything.")
-                    .clicked()
+                    if chrome::button(ui, chrome::Weight::Primary, None, "Scan selected", accent)
+                        .on_hover_text("Measures without touching anything.")
+                        .pointer()
+                        .clicked()
                     {
                         scan = true;
                     }
@@ -3362,12 +4297,17 @@ impl App {
                     } else {
                         ("Clean", chrome::Weight::Danger)
                     };
-                    if chrome::button(ui, weight, None, label, accent).clicked() {
+                    if chrome::button(ui, weight, None, label, accent)
+                        .pointer()
+                        .clicked()
+                    {
                         clean = true;
                     }
                 });
                 if busy
-                    && chrome::button(ui, chrome::Weight::Ghost, None, "Cancel", accent).clicked()
+                    && chrome::button(ui, chrome::Weight::Ghost, None, "Cancel", accent)
+                        .pointer()
+                        .clicked()
                 {
                     cancel = true;
                 }
@@ -3380,9 +4320,7 @@ impl App {
                 }
                 ui.label(RichText::new("Dry run").color(MUTED));
                 ui.add_space(theme::GAP);
-                ui.label(
-                    RichText::new(format!("{} selected", self.selected_count())).color(MUTED),
-                );
+                ui.label(RichText::new(format!("{} selected", self.selected_count())).color(MUTED));
                 ui.label(
                     RichText::new(format!(
                         "{} in {} files",
@@ -3408,13 +4346,13 @@ impl App {
 
         ui.add_space(theme::GAP);
         ui.horizontal(|ui| {
-            if ghost(ui, "Select all").clicked() {
+            if ghost(ui, "Select all").pointer().clicked() {
                 for t in &mut self.targets {
                     t.selected = true;
                 }
                 selection_changed = true;
             }
-            if ghost(ui, "Select none").clicked() {
+            if ghost(ui, "Select none").pointer().clicked() {
                 for t in &mut self.targets {
                     t.selected = false;
                 }
@@ -3422,6 +4360,7 @@ impl App {
             }
             if ghost(ui, "Safe set only")
                 .on_hover_text("Per-user caches that need no elevation.")
+                .pointer()
                 .clicked()
             {
                 for t in &mut self.targets {
@@ -3495,11 +4434,8 @@ impl App {
             });
             // One hairline between rows instead of a border around each.
             let y = ui.cursor().min.y;
-            ui.painter().hline(
-                ui.min_rect().x_range(),
-                y,
-                egui::Stroke::new(1.0, hairline),
-            );
+            ui.painter()
+                .hline(ui.min_rect().x_range(), y, egui::Stroke::new(1.0, hairline));
             ui.add_space(theme::GAP_TIGHT);
         }
 
@@ -3538,12 +4474,13 @@ impl App {
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Re-read current values").clicked() {
+                if ui.button("Re-read current values").pointer().clicked() {
                     reread = true;
                 }
                 if ui
                     .button("Restart Explorer")
                     .on_hover_text("Applies the shell tweaks without signing out.")
+                    .pointer()
                     .clicked()
                 {
                     restart_explorer = true;
@@ -3715,7 +4652,7 @@ impl App {
             }) {
                 let mut requested = None;
                 theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         let mut on = tweak.state == State::On;
                         let blocked = tweak.needs_admin() && !elevated;
@@ -3782,6 +4719,7 @@ impl App {
                                             egui::Button::new("Apply recommendation"),
                                         )
                                         .on_disabled_hover_text("Administrator access is required.")
+                                        .pointer()
                                         .clicked()
                                     {
                                         requested = Some(true);
@@ -3797,9 +4735,8 @@ impl App {
                                             )
                                         })
                                         .inner
-                                        .on_disabled_hover_text(
-                                            "Administrator access is required.",
-                                        )
+                                        .on_disabled_hover_text("Administrator access is required.")
+                                        .pointer()
                                         .clicked()
                                     {
                                         requested = Some(false);
@@ -3855,9 +4792,9 @@ impl App {
         let mut launch: Option<PathBuf> = None;
         for path in &diagcabs {
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    if ui.button("Run").clicked() {
+                    if ui.button("Run").pointer().clicked() {
                         launch = Some(path.clone());
                     }
                     ui.label(
@@ -3881,69 +4818,410 @@ impl App {
         }
     }
 
-    fn page_diagnose(&mut self, ui: &mut Ui) {
+    /// One row per machine check: name, verdict pill, and the detail body
+    /// behind an accordion.
+    ///
+    /// Drawn from a clone of the outcomes rather than borrowing them, because
+    /// every row needs `&mut self` for the UI and the borrow checker will not
+    /// have both. Nine small structs per frame is cheaper than restructuring
+    /// the page around interior mutability.
+    ///
+    /// Every string that came from Windows is wrapped rather than painted, and
+    /// was already truncated by the check that produced it: device instance
+    /// paths and DISM output are both longer than this column has ever been.
+    /// The nine checks as one scannable list.
+    ///
+    /// A card per check put nine borders and nine paragraphs of standing
+    /// explanation on the page, so the thing you actually came to read --
+    /// which checks passed -- was buried in chrome and filler. One card of
+    /// rows reads top to bottom in a glance, and each check's explanation
+    /// moves inside its own details, where it is available to whoever wants
+    /// it and silent for everyone else.
+    fn diagnose_check_list(&mut self, ui: &mut Ui, accent: Color32) {
+        chrome::section_heading(ui, chrome::icon::TROUBLESHOOT, "Machine checks", accent);
+        ui.add_space(theme::GAP);
+
+        let outcomes = self.diagnose_outcomes.clone();
+        let running = self.diagnose_running_check;
+        let scanning = self.diagnose_scan_rx.is_some();
+        let done = outcomes.len();
+        let total = diagnose::CheckId::ALL.len();
+
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("READ-ONLY CHECKS")
+                        .font(theme::eyebrow())
+                        .color(theme::muted(ui)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if scanning || done > 0 {
+                        ui.label(
+                            RichText::new(format!("{done} of {total}"))
+                                .font(theme::readout())
+                                .color(theme::muted(ui)),
+                        );
+                    }
+                });
+            });
+
+            for (index, id) in diagnose::CheckId::ALL.into_iter().enumerate() {
+                if index > 0 {
+                    // A hairline rather than a gap: the rows are one list and
+                    // have to keep reading as one.
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 1.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().hline(
+                        rect.x_range(),
+                        rect.center().y,
+                        egui::Stroke::new(1.0, theme::line(ui)),
+                    );
+                }
+                let outcome = outcomes.iter().find(|outcome| outcome.id == id);
+                theme::row(ui).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.add(Label::new(RichText::new(id.label()).strong()).truncate());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            match outcome {
+                                Some(outcome) => {
+                                    let color = outcome
+                                        .status
+                                        .severity()
+                                        .map_or(MUTED, |severity| severity.color(ui));
+                                    chrome::pill(ui, outcome.status.label(), color);
+                                }
+                                None if running == Some(id) => {
+                                    ui.spinner();
+                                }
+                                // Before a run there is nothing to report, and
+                                // a row of "Not run" pills down the page was
+                                // nine repetitions of what the empty list
+                                // already says.
+                                None => {}
+                            }
+                        });
+                    });
+
+                    let Some(outcome) = outcome else {
+                        return;
+                    };
+                    ui.add(
+                        Label::new(
+                            RichText::new(&outcome.summary)
+                                .small()
+                                .color(theme::muted(ui)),
+                        )
+                        .wrap(),
+                    );
+                    if !outcome.details.is_empty() {
+                        let _ = chrome::accordion(
+                            ui,
+                            ("diagnose-check", id.label()),
+                            "Details",
+                            false,
+                            |ui| {
+                                for detail in &outcome.details {
+                                    ui.add(Label::new(RichText::new(detail).small()).wrap());
+                                }
+                                ui.add_space(theme::GAP_TIGHT);
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(id.explanation())
+                                            .small()
+                                            .color(theme::muted(ui)),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        );
+                    }
+                });
+            }
+
+            if !scanning && outcomes.is_empty() {
+                ui.add_space(theme::GAP_TIGHT);
+                ui.add(
+                    Label::new(
+                        RichText::new(
+                            "Not run yet. Every check only reads: none repairs, schedules or \
+                             restarts anything.",
+                        )
+                        .small()
+                        .color(theme::muted(ui)),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+    }
+
+    fn full_benchmark_panel(&mut self, ui: &mut Ui) {
         let accent = theme::accent_on(ui, self.accent);
-        if self.diagnose_event_rx.is_none() && self.diagnose_event_result.is_none() {
-            self.start_diagnosis();
-        }
         let scanned = self.scanned_total();
         let junk = self
             .targets
             .iter()
             .any(|target| target.scan.is_some())
             .then_some(scanned.bytes);
-        let health = Health::assess(&self.machine, junk);
+        let health = Health::assess(
+            &self.machine,
+            junk,
+            self.history.cpu.recent_average(30, 15),
+            self.history.gpu_load.recent_average(30, 15),
+            self.history.cpu_temp.recent_average(30, 15),
+            self.history.gpu_temp.recent_average(30, 15),
+            self.history.cpu.len(),
+            self.reliability_event_count(),
+        );
+        self.cache_health(&health);
 
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                health::face(ui, health.mood, 64.0);
-                ui.add_space(theme::GAP);
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(health.score.to_string())
-                                .font(theme::readout_large())
-                                .color(health.mood.color(ui)),
-                        );
-                        ui.label(RichText::new("/ 100 quick health snapshot").color(MUTED));
-                    });
-                    ui.label(
-                        RichText::new(health.mood.headline())
-                            .strong()
-                            .color(health.mood.color(ui)),
-                    );
-                });
-            });
-            ui.add_space(theme::GAP);
-            ui.label(
-                RichText::new(
-                    "Diagnosis checks live CPU, memory and drive pressure, and automatically reviews recent Windows System and Application errors.",
+        let benchmark_running = self.diagnose_scan_rx.is_some();
+        let have_outcomes = !self.diagnose_outcomes.is_empty();
+        // The run button alone on its line. The description that used to sit
+        // beside it repeated the tab blurb two lines above, and an unwrapped
+        // label inside a horizontal row grows the row until the right-aligned
+        // button is pushed off the edge of the page.
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if chrome::button(
+                    ui,
+                    chrome::Weight::Primary,
+                    None,
+                    if benchmark_running {
+                        "Running checks…"
+                    } else if have_outcomes {
+                        "Run the checks again"
+                    } else {
+                        "Run the checks"
+                    },
+                    accent,
                 )
-                .small()
-                .color(MUTED),
+                .pointer()
+                .clicked()
+                    && !benchmark_running
+                {
+                    self.start_diagnosis(true);
+                }
+            });
+        });
+        ui.add_space(theme::GAP_SECTION);
+
+        let cpu_color = if self.cpu_usage > 90.0 {
+            theme::warn(ui)
+        } else {
+            accent
+        };
+        let memory_fraction = self.machine.ram_fraction().clamp(0.0, 1.0);
+        let memory_color = if memory_fraction > 0.95 {
+            theme::bad(ui)
+        } else if memory_fraction > 0.85 {
+            theme::warn(ui)
+        } else {
+            accent
+        };
+        let memory_status = if memory_fraction > 0.95 {
+            "Very high"
+        } else if memory_fraction > 0.85 {
+            "High"
+        } else {
+            "Normal"
+        };
+        let cpu_status = if self.cpu_usage > 90.0 {
+            "High"
+        } else {
+            "Normal"
+        };
+        let cpu_detail = if self.cpu_usage > 90.0 {
+            "High now · see busiest apps in details"
+        } else {
+            "Current processor activity"
+        };
+        let system_drive = self
+            .machine
+            .disks
+            .iter()
+            .find(|disk| crate::machine::is_system_drive_mount(&disk.mount));
+        let drive_summary = system_drive.map(|disk| {
+            (
+                format!("{:.0}%", disk.used_fraction() * 100.0),
+                format!("{} free", human_bytes(disk.available)),
+                disk.used_fraction(),
+            )
+        });
+        let drive_color = drive_summary
+            .as_ref()
+            .filter(|(_, _, fraction)| *fraction >= 0.90)
+            .map_or(accent, |_| theme::warn(ui));
+        let drive_status = drive_summary
+            .as_ref()
+            .map(|(_, _, fraction)| {
+                if *fraction >= 0.90 {
+                    "Low space"
+                } else {
+                    "Available"
+                }
+            })
+            .unwrap_or("Not found");
+        let event_count = self.reliability_event_count();
+        let event_value = event_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "…".into());
+        let event_color = if event_count.is_some_and(|count| count > 0) {
+            theme::warn(ui)
+        } else if event_count.is_some() {
+            theme::good(ui)
+        } else {
+            MUTED
+        };
+
+        ui.columns(2, |columns| {
+            metric_widget(
+                &mut columns[0],
+                chrome::icon::DEVICES,
+                "Processor",
+                &format!("{:.0}%", self.cpu_usage),
+                cpu_status,
+                cpu_detail,
+                Some(self.cpu_usage / 100.0),
+                cpu_color,
+            );
+            metric_widget(
+                &mut columns[1],
+                chrome::icon::MEMORY,
+                "Memory",
+                &format!("{:.0}%", memory_fraction * 100.0),
+                memory_status,
+                &self.machine.ram_summary(),
+                Some(memory_fraction),
+                memory_color,
+            );
+            columns[0].add_space(theme::GAP);
+            if let Some((value, detail, fraction)) = &drive_summary {
+                metric_widget(
+                    &mut columns[0],
+                    chrome::icon::STORAGE,
+                    "Windows drive",
+                    value,
+                    drive_status,
+                    detail,
+                    Some(*fraction),
+                    drive_color,
+                );
+            } else {
+                metric_widget(
+                    &mut columns[0],
+                    chrome::icon::STORAGE,
+                    "Windows drive",
+                    "—",
+                    drive_status,
+                    "Windows drive not identified",
+                    None,
+                    MUTED,
+                );
+            }
+            columns[1].add_space(theme::GAP);
+            let reliability_status = if event_count.is_none() {
+                "Checking"
+            } else if event_count.is_some_and(|count| count > 0) {
+                "Review"
+            } else {
+                "Clear"
+            };
+            metric_widget(
+                &mut columns[1],
+                chrome::icon::DIAGNOSTICS,
+                "Windows reliability",
+                &event_value,
+                reliability_status,
+                "Critical and error events in the last 24 hours",
+                None,
+                event_color,
             );
         });
+        ui.add_space(theme::GAP_SECTION);
+        chrome::section_heading(
+            ui,
+            chrome::icon::DIAGNOSTICS,
+            "What needs attention",
+            accent,
+        );
+        let mut action_notes = health
+            .notes
+            .iter()
+            .filter(|note| note.severity != health::Severity::Info)
+            .collect::<Vec<_>>();
+        action_notes.sort_by_key(|note| match note.severity {
+            health::Severity::Bad => 0,
+            health::Severity::Warn => 1,
+            health::Severity::Info => 2,
+        });
+        if action_notes.is_empty() {
+            theme::row(ui).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("✓").color(theme::good(ui)));
+                    ui.label("No urgent performance or reliability issue is showing right now.");
+                });
+            });
+        } else {
+            for note in action_notes.iter().take(4) {
+                theme::row(ui).show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.label(RichText::new("●").strong().color(note.severity.color(ui)));
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&note.text).strong());
+                            ui.add(
+                                Label::new(RichText::new(note.recommendation).small().color(MUTED))
+                                    .wrap(),
+                            );
+                        });
+                    });
+                });
+            }
+            if action_notes.len() > 4 {
+                let _ = chrome::accordion(
+                    ui,
+                    "health-more-notes",
+                    &format!("{} more items", action_notes.len() - 4),
+                    false,
+                    |ui| {
+                        for note in action_notes.iter().skip(4) {
+                            theme::row(ui).show(ui, |ui| {
+                                ui.horizontal_top(|ui| {
+                                    ui.label(RichText::new("●").color(note.severity.color(ui)));
+                                    ui.vertical(|ui| {
+                                        ui.label(&note.text);
+                                        ui.add(
+                                            Label::new(
+                                                RichText::new(note.recommendation)
+                                                    .small()
+                                                    .color(MUTED),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                });
+                            });
+                        }
+                    },
+                );
+            }
+        }
+
+        ui.add_space(theme::GAP_SECTION);
+        self.diagnose_check_list(ui, accent);
 
         ui.add_space(theme::GAP);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Current performance").strong());
-            if ui
-                .add_enabled(
-                    self.diagnose_event_rx.is_none(),
-                    Button::new(if self.diagnose_event_result.is_some() {
-                        "Run diagnosis again"
-                    } else {
-                        "Run diagnosis"
-                    }),
-                )
-                .clicked()
-            {
-                self.start_diagnosis();
-            }
-        });
-        ui.add_space(theme::GAP);
-        theme::card(ui).show(ui, |ui| {
+        let _ = chrome::accordion(
+            ui,
+            "detailed-performance",
+            "Detailed performance readings",
+            false,
+            |ui| {
+                theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             chrome::meter(
                 ui,
@@ -3976,7 +5254,7 @@ impl App {
                 .collect();
             cpu_processes.sort_by(|a, b| b.2.total_cmp(&a.2));
             if !cpu_processes.is_empty() {
-                ui.collapsing("Largest current CPU users", |ui| {
+                let _ = chrome::accordion(ui, "largest-cpu-users", "Largest current CPU users", false, |ui| {
                     for (name, pid, usage) in cpu_processes.iter().take(5) {
                         ui.label(format!("{name}  ·  {usage:.0}%  ·  PID {pid}"));
                     }
@@ -3989,64 +5267,46 @@ impl App {
                     );
                 });
             }
-            if let Some(memory) = &self.ram_snapshot {
-                let used = memory
-                    .physical_total_bytes
-                    .saturating_sub(memory.physical_available_bytes);
-                let fraction = if memory.physical_total_bytes == 0 {
-                    0.0
-                } else {
-                    used as f32 / memory.physical_total_bytes as f32
-                };
-                chrome::meter(
-                    ui,
-                    fraction,
-                    if fraction > 0.90 { theme::warn(ui) } else { self.accent },
-                    Some(&format!(
-                        "RAM in use  {} of {}",
-                        human_bytes(used),
-                        human_bytes(memory.physical_total_bytes)
-                    )),
-                );
-                if fraction > 0.90 {
+            // A failed read still has to be said, because the Memory tile at
+            // the top of the page falls back to a different counter and will
+            // happily show a figure when this one is unavailable.
+            if self.ram_snapshot.is_none() {
+                if let Some(error) = &self.ram_error {
                     ui.label(
-                        RichText::new("Available physical memory is low right now.").color(theme::warn(ui)),
+                        RichText::new(format!("Memory counters unavailable: {error}"))
+                            .small()
+                            .color(MUTED),
                     );
                 }
-            } else if let Some(error) = &self.ram_error {
-                ui.label(
-                    RichText::new(format!("Memory counters unavailable: {error}"))
-                        .small()
-                        .color(MUTED),
-                );
             }
-            let low_space: Vec<_> = self
+            let system_drive = self
                 .machine
                 .disks
                 .iter()
-                .filter(|disk| disk.used_fraction() >= 0.90)
-                .collect();
-            if low_space.is_empty() {
-                ui.label(
-                    RichText::new("Mounted drives: no drive is above 90% full.")
+                .find(|disk| crate::machine::is_system_drive_mount(&disk.mount));
+            match system_drive {
+                Some(disk) if disk.used_fraction() >= 0.90 => ui.label(
+                    RichText::new(format!(
+                        "Low free space: Windows drive {} is {:.0}% full ({} free)",
+                        disk.mount.trim_end_matches('\\'),
+                        disk.used_fraction() * 100.0,
+                        human_bytes(disk.available)
+                    ))
+                    .color(theme::warn(ui)),
+                ),
+                Some(_) => ui.label(
+                    RichText::new("Windows drive: no low-space warning.")
                         .small()
                         .color(MUTED),
-                );
-            } else {
-                for disk in low_space {
-                    ui.label(
-                        RichText::new(format!(
-                            "Low free space: {} is {:.0}% full ({} free)",
-                            disk.mount.trim_end_matches('\\'),
-                            disk.used_fraction() * 100.0,
-                            human_bytes(disk.available)
-                        ))
-                        .color(theme::warn(ui)),
-                    );
-                }
-            }
+                ),
+                None => ui.label(
+                    RichText::new("Windows system drive could not be identified.")
+                        .small()
+                        .color(MUTED),
+                ),
+            };
             if !self.ram_processes.is_empty() {
-                ui.collapsing("Largest process memory use", |ui| {
+                let _ = chrome::accordion(ui, "largest-memory-users", "Largest process memory use", false, |ui| {
                     for process in self.ram_processes.iter().take(5) {
                         ui.label(format!(
                             "{}  ·  {}",
@@ -4105,14 +5365,33 @@ impl App {
                 }
             }
         });
+            },
+        );
 
-        ui.add_space(theme::GAP);
-        ui.label(RichText::new("Recent Windows errors").strong());
-        ui.add_space(theme::GAP);
-        theme::card(ui).show(ui, |ui| {
+        ui.add_space(theme::GAP_SECTION);
+        let event_summary = if self.diagnose_events_pending() {
+            "Checking…".to_string()
+        } else if let Some(result) = &self.diagnose_event_result {
+            match &result.status {
+                ScanStatus::Complete if result.findings.is_empty() => "No errors found".into(),
+                ScanStatus::Complete => format!("{} events to review", result.findings.len()),
+                ScanStatus::Partial => "Partial check".into(),
+                ScanStatus::Unsupported => "Unavailable".into(),
+                ScanStatus::Error(_) => "Could not check".into(),
+            }
+        } else {
+            "Not checked yet".to_string()
+        };
+        let _ = chrome::accordion(
+            ui,
+            "windows-event-log",
+            &format!("Windows event log · {event_summary}"),
+            false,
+            |ui| {
+                theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("System and Application logs · Critical and Error events · past 24 hours").small().color(MUTED));
-            if self.diagnose_event_rx.is_some() {
+            if self.diagnose_events_pending() {
                 ui.add_space(theme::GAP);
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -4134,6 +5413,7 @@ impl App {
                 } else if !result.findings.is_empty() {
                     ui.add_space(theme::GAP);
                     ui.label(RichText::new("These entries are clues to investigate; a log event alone does not prove the cause of a slowdown.").small().color(MUTED));
+                    ui.label(RichText::new("Next: compare repeated event sources and timestamps with the freezes, crashes, or slowdowns you noticed.").small().color(MUTED));
                     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                         for (index, finding) in result.findings.iter().take(30).enumerate() {
                             draw_diagnostic_event(ui, index, finding);
@@ -4145,69 +5425,8 @@ impl App {
                 }
             }
         });
-
-        ui.add_space(theme::GAP);
-        ui.label(RichText::new("Other health checks").strong());
-        ui.add_space(theme::GAP);
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            for note in &health.notes {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").color(note.severity.color(ui)));
-                    ui.label(&note.text);
-                });
-                ui.add_space(theme::GAP_TIGHT);
-            }
-        });
-
-        ui.add_space(theme::GAP);
-        let mut open_memory = false;
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(chrome::icon_text(chrome::icon::MEMORY, 20.0, accent));
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Memory").strong());
-                    ui.label(
-                        RichText::new(self.machine.ram_summary())
-                            .small()
-                            .color(MUTED),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ghost(ui, "Open Memory").clicked() {
-                        open_memory = true;
-                    }
-                });
-            });
-        });
-        if open_memory {
-            self.tab = Tab::Memory;
-        }
-
-        ui.add_space(theme::GAP);
-        ui.label(RichText::new("Next steps").strong());
-        ui.add_space(theme::GAP);
-        ui.horizontal(|ui| {
-            if ui.button("Open Storage").clicked() {
-                self.tab = Tab::Storage;
-                self.storage_view = StorageView::Summary;
-                self.storage_expanded = true;
-            }
-            if ui.button("Open Cleanup").clicked() {
-                self.tab = Tab::Storage;
-                self.storage_view = StorageView::Cleanup;
-                self.storage_expanded = true;
-            }
-            if ui.button("RAM cleanup").clicked() {
-                self.tab = Tab::Storage;
-                self.storage_view = StorageView::Cleanup;
-                self.storage_expanded = true;
-            }
-            if ui.button("Open Troubleshoot").clicked() {
-                self.tab = Tab::Troubleshoot;
-            }
-        });
+            },
+        );
     }
 
     fn page_security(&mut self, ui: &mut Ui) {
@@ -4227,11 +5446,11 @@ impl App {
         ui.add_space(theme::GAP);
         let checking_integrity = self.explorer_integrity_rx.is_some();
         ui.horizontal(|ui| {
-            if ui.add_enabled(!checking_integrity, Button::new("Check Explorer integrity")).clicked() {
+            if ui.add_enabled(!checking_integrity, Button::new("Check Explorer integrity")).pointer().clicked() {
                 self.explorer_integrity_result = None;
                 self.explorer_integrity_rx = Some(security_integrity::start_scan());
             }
-            if ui.button("Verify Windows copy with SFC").on_hover_text("Runs the Windows verify-only check in a console; it does not repair files.").clicked() {
+            if ui.button("Verify Windows copy with SFC").on_hover_text("Runs the Windows verify-only check in a console; it does not repair files.").pointer().clicked() {
                 match security_integrity::launch_system_explorer_verify() {
                     Ok(()) => self.say("Started SFC verify-only check for the Windows Explorer file. Review its console output."),
                     Err(error) => self.complain(format!("Could not start SFC: {error}")),
@@ -4245,98 +5464,125 @@ impl App {
             });
         }
         if let Some(result) = &self.explorer_integrity_result {
-            theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-                ui.label(RichText::new("Windows Explorer executable").strong());
-                let status = match &result.status {
-                    security_integrity::ScanStatus::Complete => "Inventory complete",
-                    security_integrity::ScanStatus::Partial => "Inventory partial",
-                    security_integrity::ScanStatus::Unsupported => "Unsupported system",
-                    security_integrity::ScanStatus::Error(_) => "Check failed",
-                };
-                ui.label(RichText::new(status).color(
-                    if matches!(&result.status, security_integrity::ScanStatus::Complete) {
-                        theme::good(ui)
-                    } else {
-                        theme::warn(ui)
-                    },
-                ));
-                if let security_integrity::ScanStatus::Error(error) = &result.status {
-                    ui.label(RichText::new(error).small().color(theme::warn(ui)));
-                }
-                ui.label(
-                    RichText::new(&result.system_explorer_path)
-                        .small()
-                        .monospace(),
-                );
-                let system_signature_valid =
-                    result.system_signature_status.eq_ignore_ascii_case("Valid");
-                ui.label(
-                    RichText::new(format!(
-                        "Authenticode: {}{}",
-                        result.system_signature_status,
-                        if result.system_signer.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {}", result.system_signer)
-                        }
-                    ))
-                    .color(if system_signature_valid { theme::good(ui) } else { theme::warn(ui) }),
-                );
-                ui.add_space(theme::GAP);
-                ui.label(
-                    RichText::new(format!(
-                        "Running explorer.exe instances: {}",
-                        result.processes.len()
-                    ))
-                    .strong(),
-                );
-                for process in &result.processes {
-                    let expected_path = process
-                        .image_path
-                        .eq_ignore_ascii_case(&result.system_explorer_path);
-                    let signature_valid = process.signature_status.eq_ignore_ascii_case("Valid");
-                    let suspicious_context = !expected_path || !signature_valid;
+            let scan_complete = matches!(&result.status, security_integrity::ScanStatus::Complete);
+            let signature_valid = result.system_signature_status.eq_ignore_ascii_case("Valid");
+            let status_color = if scan_complete && signature_valid {
+                theme::good(ui)
+            } else {
+                theme::warn(ui)
+            };
+            theme::widget(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(chrome::icon_text(chrome::icon::SHIELD, 22.0, status_color));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Windows Explorer integrity").strong());
+                        ui.label(format!("{} running instance(s)", result.processes.len()));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        chrome::pill(
+                            ui,
+                            if scan_complete && signature_valid {
+                                "Verified"
+                            } else {
+                                "Review"
+                            },
+                            status_color,
+                        );
+                    });
+                });
+            });
+            let _ = chrome::accordion(
+                ui,
+                "explorer-exe-details",
+                "Executable path and process details",
+                false,
+                |ui| {
                     ui.label(
-                        RichText::new(format!(
-                            "PID {} · parent {} · session {} · {}",
-                            process.pid, process.parent_pid, process.session_id, process.image_path
-                        ))
-                        .small()
-                        .monospace()
-                        .color(if suspicious_context {
-                            theme::warn(ui)
-                        } else {
-                            MUTED
-                        }),
+                        RichText::new(&result.system_explorer_path)
+                            .small()
+                            .monospace(),
                     );
                     ui.label(
                         RichText::new(format!(
-                            "Authenticode: {}{}{}",
-                            process.signature_status,
-                            if process.signer.is_empty() {
+                            "Authenticode: {}{}",
+                            result.system_signature_status,
+                            if result.system_signer.is_empty() {
                                 String::new()
                             } else {
-                                format!(" · {}", process.signer)
-                            },
-                            if !expected_path {
-                                " · unexpected image path"
-                            } else {
-                                ""
+                                format!(" · {}", result.system_signer)
                             }
                         ))
                         .small()
-                        .color(if suspicious_context {
-                            theme::warn(ui)
-                        } else {
-                            theme::good(ui)
-                        }),
+                        .color(status_color),
                     );
-                }
-                for note in &result.notes {
-                    ui.label(RichText::new(note).small().color(MUTED));
-                }
-            });
+                    if let security_integrity::ScanStatus::Error(error) = &result.status {
+                        ui.label(RichText::new(error).small().color(theme::warn(ui)));
+                    }
+                    for process in &result.processes {
+                        let expected_path = process
+                            .image_path
+                            .eq_ignore_ascii_case(&result.system_explorer_path);
+                        let signature_valid =
+                            process.signature_status.eq_ignore_ascii_case("Valid");
+                        let suspicious_context = !expected_path || !signature_valid;
+                        theme::row(ui).show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "PID {} · parent {} · session {}",
+                                    process.pid, process.parent_pid, process.session_id
+                                ))
+                                .strong(),
+                            );
+                            ui.label(
+                                RichText::new(&process.image_path)
+                                    .small()
+                                    .monospace()
+                                    .color(if suspicious_context {
+                                        theme::warn(ui)
+                                    } else {
+                                        MUTED
+                                    }),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "Authenticode: {}{}{}",
+                                    process.signature_status,
+                                    if process.signer.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" · {}", process.signer)
+                                    },
+                                    if !expected_path {
+                                        " · unexpected image path"
+                                    } else {
+                                        ""
+                                    }
+                                ))
+                                .small()
+                                .color(if suspicious_context {
+                                    theme::warn(ui)
+                                } else {
+                                    theme::good(ui)
+                                }),
+                            );
+                        });
+                    }
+                    if !result.notes.is_empty() {
+                        let _ = chrome::accordion(
+                            ui,
+                            "explorer-scanner-notes",
+                            "Scanner notes",
+                            false,
+                            |ui| {
+                                for note in &result.notes {
+                                    ui.label(RichText::new(note).small().color(MUTED));
+                                }
+                            },
+                        );
+                    }
+                },
+            );
         }
 
         ui.add_space(theme::GAP_SECTION);
@@ -4354,6 +5600,7 @@ impl App {
         let scanning_network = self.network_scan_rx.is_some();
         if ui
             .add_enabled(!scanning_network, Button::new("Refresh network activity"))
+            .pointer()
             .clicked()
         {
             self.start_network_scan();
@@ -4406,9 +5653,12 @@ impl App {
                     .iter()
                     .filter(|connection| connection.direction == direction)
                     .collect::<Vec<_>>();
-                egui::CollapsingHeader::new(format!("{title} · {}", connections.len()))
-                    .default_open(!connections.is_empty())
-                    .show(ui, |ui| {
+                let _ = chrome::accordion(
+                    ui,
+                    ("network-connections", title),
+                    &format!("{title} · {}", connections.len()),
+                    !connections.is_empty(),
+                    |ui| {
                         ui.label(RichText::new(description).small().color(MUTED));
                         if connections.is_empty() {
                             ui.label(
@@ -4424,7 +5674,7 @@ impl App {
                                 NetworkSeverity::Info => ("Info", MUTED),
                             };
                             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                                ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.label(chrome::icon_text(chrome::icon::SHIELD, 16.0, color));
                                     ui.label(RichText::new(severity).strong().color(color));
@@ -4486,9 +5736,13 @@ impl App {
                                 .color(MUTED),
                             );
                         }
-                    });
+                    },
+                );
             }
-            para(ui, "A connection or unusual port is not proof of malware. Use Defender for a full system scan. This view is a snapshot, not continuous packet monitoring.");
+            para(
+                ui,
+                "A connection or unusual port is not proof of malware. Use Defender for a full system scan. This view is a snapshot, not continuous packet monitoring.",
+            );
         }
 
         theme::card(ui).show(ui, |ui| {
@@ -4517,14 +5771,17 @@ impl App {
             ui.label(chrome::icon_text(chrome::icon::SHIELD, 20.0, accent));
             ui.label(RichText::new("Online malware hash lookup").strong());
         });
-        para(ui, "MalwareBazaar checks a selected file's SHA-256 against its malware database. The file is hashed locally; only its hash is sent. This is opt-in and requires an Auth-Key. No file contents are uploaded or samples downloaded.");
+        para(
+            ui,
+            "MalwareBazaar checks a selected file's SHA-256 against its malware database. The file is hashed locally; only its hash is sent. This is opt-in and requires an Auth-Key. No file contents are uploaded or samples downloaded.",
+        );
         ui.add_space(theme::GAP_TIGHT);
         ui.hyperlink_to(
             "MalwareBazaar API and key information",
             "https://bazaar.abuse.ch/api/",
         );
         ui.horizontal(|ui| {
-            if ui.button("Choose file…").clicked() {
+            if ui.button("Choose file…").pointer().clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     self.malware_lookup_path = Some(path);
                     self.malware_lookup_result = None;
@@ -4553,6 +5810,7 @@ impl App {
             let busy = self.malware_lookup_rx.is_some();
             if ui
                 .add_enabled(!busy, Button::new("Check hash online"))
+                .pointer()
                 .clicked()
             {
                 self.start_malware_lookup();
@@ -4582,7 +5840,7 @@ impl App {
         ui.label(RichText::new("Recent MalwareBazaar feed scan").strong());
         ui.label(RichText::new(format!("Fetches metadata for the latest 100 MalwareBazaar records, then compares local SHA-256 hashes for common executable and script files in one selected folder. Maximum {} files, {} each, 60 seconds. This recent feed is limited coverage, not a full antivirus scan.", malware_lookup::RECENT_SCAN_MAX_FILES, human_bytes(malware_lookup::RECENT_SCAN_MAX_FILE_BYTES))).small().color(MUTED));
         ui.horizontal(|ui| {
-            if ui.button("Choose folder…").clicked() {
+            if ui.button("Choose folder…").pointer().clicked() {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                     self.malware_feed_scan_folder = Some(folder);
                     self.malware_feed_scan_result = None;
@@ -4611,6 +5869,7 @@ impl App {
             let busy = self.malware_feed_scan_rx.is_some();
             if ui
                 .add_enabled(!busy, Button::new("Scan folder against recent feed"))
+                .pointer()
                 .clicked()
             {
                 self.start_malware_feed_scan();
@@ -4660,7 +5919,12 @@ impl App {
                         );
                     }
                     for finding in &report.matches {
-                        ui.label(RichText::new(&finding.path).small().monospace().color(theme::warn(ui)));
+                        ui.label(
+                            RichText::new(&finding.path)
+                                .small()
+                                .monospace()
+                                .color(theme::warn(ui)),
+                        );
                         ui.label(
                             RichText::new(format!("SHA-256: {}", finding.sha256))
                                 .small()
@@ -4693,6 +5957,7 @@ impl App {
                 !scanning,
                 Button::new("Scan common locations for token grabbers"),
             )
+            .pointer()
             .clicked()
         {
             self.token_scan_report = None;
@@ -4735,13 +6000,13 @@ impl App {
             let mut open_folder = None;
             for finding in &report.findings {
                 theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(RichText::new(finding.path.display().to_string()).monospace());
                             ui.label(RichText::new(&finding.reason).small().color(MUTED));
                         });
-                        if ui.button("Show folder").clicked() {
+                        if ui.button("Show folder").pointer().clicked() {
                             open_folder = finding.path.parent().map(PathBuf::from);
                         }
                     });
@@ -4771,6 +6036,7 @@ impl App {
             if ui
                 .button("Restart as administrator")
                 .on_hover_text("Closes this window and reopens it with an administrator token.")
+                .pointer()
                 .clicked()
             {
                 elevate = true;
@@ -4810,37 +6076,36 @@ impl App {
                 let column = index % columns.len();
                 let target = &mut columns[column];
                 let glyph = tool_icon(&action.name);
-                theme::card(target).show(target, |ui| {
-                    // Fixed tiles, so the grid lines up and the Open buttons
-                    // share a baseline.
+                let (clicked, _) = chrome::card_button(target, ("tool", index), |ui| {
+                    // Fixed tiles, so the grid lines up however long the
+                    // descriptions run.
                     ui.set_min_height(148.0);
                     ui.set_max_height(148.0);
-                    ui.label(chrome::icon_text(glyph, 24.0, accent));
+                    ui.horizontal(|ui| {
+                        ui.label(chrome::icon_text(glyph, 24.0, accent));
+                        if action.needs_admin {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                chrome::pill(ui, "admin", theme::warn(ui));
+                            });
+                        }
+                    });
                     ui.add_space(theme::GAP_TIGHT);
-                    ui.label(RichText::new(&action.name).strong());
+                    ui.add(Label::new(RichText::new(&action.name).strong()).truncate());
                     // ui.columns hands down a *justified* layout, which stretches
                     // a label that wraps -- that is what spaced the words of the
                     // longer descriptions out across the line.
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.label(RichText::new(&action.what).small().color(MUTED));
                     });
-                    if action.needs_admin {
-                        ui.label(RichText::new("Administrator required").small().color(theme::warn(ui)));
-                    }
-                    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                        if ui.button("Open").clicked() {
-                            launch = Some(action.clone());
-                        }
-                    });
                 });
+                if clicked.pointer().clicked() {
+                    launch = Some(action.clone());
+                }
                 target.add_space(10.0);
             }
         });
         if let Some(action) = launch {
-            match action.launch() {
-                Ok(()) => self.say(format!("Launched {}.", action.name)),
-                Err(e) => self.complain(format!("{}: {e}", action.name)),
-            }
+            self.launch_action(action);
         }
     }
 
@@ -4851,7 +6116,7 @@ impl App {
 
         for action in actions {
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let blocked = action.needs_admin && !elevated;
                     let button_label = if action.name.starts_with("Microsoft Defender") {
@@ -4884,6 +6149,7 @@ impl App {
                             })
                             .inner
                             .on_disabled_hover_text("Needs administrator rights.")
+                            .pointer()
                             .clicked()
                         {
                             launch = Some(action.clone());
@@ -4895,10 +6161,7 @@ impl App {
         }
 
         if let Some(action) = launch {
-            match action.launch() {
-                Ok(()) => self.say(format!("Launched {}.", action.name)),
-                Err(e) => self.complain(format!("{}: {e}", action.name)),
-            }
+            self.launch_action(action);
         }
     }
 
@@ -4907,6 +6170,20 @@ impl App {
         let mut export = false;
         let mut restore_point = false;
         let mut protection = false;
+
+        let running = self.backup_job.as_ref().map(|(job, _)| *job);
+        if let Some(job) = running {
+            theme::widget(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.add_space(theme::GAP_TIGHT);
+                    ui.label(RichText::new(job.running_text()).font(theme::readout()));
+                });
+            });
+            ui.add_space(theme::GAP);
+        }
+        let busy = running.is_some();
 
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -4921,7 +6198,12 @@ impl App {
             );
             ui.add_space(theme::GAP);
             if ui
-                .button(RichText::new("Choose folder and export").strong())
+                .add_enabled(
+                    !busy,
+                    Button::new(RichText::new("Choose folder and export").strong()),
+                )
+                .on_disabled_hover_text("A backup task is already running.")
+                .pointer()
                 .clicked()
             {
                 export = true;
@@ -4953,14 +6235,22 @@ impl App {
             );
             ui.add_space(theme::GAP);
             if ui
-                .add_enabled(self.elevated, Button::new("Create restore point"))
-                .on_disabled_hover_text("Needs administrator rights.")
+                .add_enabled(self.elevated && !busy, Button::new("Create restore point"))
+                .on_disabled_hover_text(if busy {
+                    "A backup task is already running."
+                } else {
+                    "Needs administrator rights."
+                })
+                .pointer()
                 .clicked()
             {
                 restore_point = true;
             }
             ui.add_space(theme::GAP_TIGHT);
-            if ghost(ui, "Open System Protection settings").clicked() {
+            if ghost(ui, "Open System Protection settings")
+                .pointer()
+                .clicked()
+            {
                 protection = true;
             }
         });
@@ -4973,22 +6263,17 @@ impl App {
                 }
             }
             if let Some(dir) = dialog.pick_folder() {
-                match tools::export_registry(&dir) {
-                    Ok(files) => {
-                        let count = files.len();
-                        self.backups = files;
-                        self.settings.remember_backup_dir(&dir);
-                        self.say(format!("Exported {count} hives to {}.", dir.display()));
-                    }
-                    Err(e) => self.complain(e),
-                }
+                self.settings.remember_backup_dir(&dir);
+                self.say(format!(
+                    "Exporting the registry to {}\u{2026}",
+                    dir.display()
+                ));
+                self.start_backup_job(BackupJob::Export, Some(dir));
             }
         }
         if restore_point {
-            match tools::create_restore_point() {
-                Ok(()) => self.say("Restore point created."),
-                Err(e) => self.complain(e),
-            }
+            self.say("Creating a restore point. This can take a minute.");
+            self.start_backup_job(BackupJob::RestorePoint, None);
         }
         if protection {
             match crate::util::spawn("SystemPropertiesProtection.exe", &[]) {
@@ -4998,7 +6283,14 @@ impl App {
         }
     }
 
-    fn page_ai_connections(&mut self, ui: &mut Ui) {
+    /// The AI connection controls, as a section of the Settings page.
+    ///
+    /// This was a top-level tab until it became clear what it actually is: a
+    /// preference about which local MCP server the app talks to. It sat in
+    /// the sidebar between Backup and System Info, among pages that change
+    /// the machine, and so read as something far weightier than two text
+    /// fields and a list of tool names.
+    fn ai_connections_section(&mut self, ui: &mut Ui) {
         let mut events = Vec::new();
         if let Some(connection) = &self.mcp_connection {
             while let Ok(event) = connection.events.try_recv() {
@@ -5034,50 +6326,176 @@ impl App {
             self.mcp_connection = None;
         }
 
-        ui.label(RichText::new("MCP server connection").font(theme::section_title()).strong());
-        ui.label(
-            RichText::new(
-                "Connect a local Model Context Protocol server. This page only connects and lists tools; it does not run them or send data to Claude/OpenAI.",
+        // Discovery hits the disk, so it happens on the first frame this
+        // section is drawn and never again. Doing it in `App::new` charged
+        // every launch for a section most people never scroll to; doing it
+        // while painting read two files at the refresh rate.
+        if self.ai_discovered.is_none() {
+            self.ai_discovered = Some(crate::ai_config::discover());
+        }
+        // Moved out rather than borrowed, because the rows below are drawn
+        // from this list and clicking one writes to `self`. Taking it for the
+        // length of the frame is what lets both happen without cloning every
+        // string each frame; it goes back at the end.
+        let discovered = self.ai_discovered.take().unwrap_or_default();
+
+        let accent = theme::accent_on(ui, self.accent);
+        chrome::section_heading(ui, chrome::icon::TOOLS, "AI connections", accent);
+        ui.add_space(theme::GAP_TIGHT);
+        ui.add(
+            Label::new(
+                RichText::new(
+                    "Connect a local Model Context Protocol server. Claude and OpenAI here are \
+                     the two programs on this PC that already keep a list of them; nothing is \
+                     sent to either company.",
+                )
+                .small()
+                .color(MUTED),
             )
-            .small()
-            .color(MUTED),
+            .wrap(),
         );
         ui.add_space(theme::GAP);
 
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new("Server program").strong());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.mcp_program)
-                    .hint_text(r"Full path or executable name, e.g. C:\Tools\my-mcp-server.exe")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(theme::GAP);
-            ui.label(RichText::new("Arguments · one per line").strong());
-            ui.add(
-                egui::TextEdit::multiline(&mut self.mcp_args)
-                    .hint_text("--stdio\n--config\nC:\\path with spaces\\server.json")
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(3),
-            );
-            ui.add_space(theme::GAP);
-            ui.label(
-                RichText::new(
-                    "Only connect to a server you trust. Connecting starts the program above with these arguments. Its stdout is reserved for MCP messages.",
-                )
-                .small()
-                .color(theme::warn(ui)),
-            );
-            ui.add_space(theme::GAP);
-            ui.horizontal(|ui| {
-                let connected = self.mcp_connection.is_some();
-                if ui
-                    .add_enabled(
-                        !connected && !self.mcp_program.trim().is_empty(),
-                        Button::new("Connect"),
-                    )
+        ui.horizontal(|ui| {
+            for source in [AiSource::Claude, AiSource::OpenAi, AiSource::Custom] {
+                let selected = self.ai_source == source;
+                if chrome::segment(ui, source.label(), selected, accent)
+                    .pointer()
                     .clicked()
                 {
+                    self.ai_source = source;
+                }
+            }
+        });
+        ui.add_space(theme::GAP);
+
+        // Both a discovered row and the Connect button want the same thing to
+        // happen, and neither can touch `self` where the decision is made, so
+        // the choice is carried out of the card and acted on below it.
+        let mut connect_to: Option<(String, Vec<String>)> = None;
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match self.ai_source.discovery() {
+                None => {
+                    ui.label(RichText::new("Server program").strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.mcp_program)
+                            .hint_text(
+                                r"Full path or executable name, e.g. C:\Tools\my-mcp-server.exe",
+                            )
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(theme::GAP);
+                    ui.label(RichText::new("Arguments · one per line").strong());
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.mcp_args)
+                            .hint_text("--stdio\n--config\nC:\\path with spaces\\server.json")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3),
+                    );
+                }
+                Some(wanted) => {
+                    let mut shown = 0usize;
+                    for (index, entry) in discovered
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| entry.source == wanted)
+                    {
+                        if shown > 0 {
+                            ui.add_space(theme::GAP_TIGHT);
+                        }
+                        shown += 1;
+                        let live =
+                            self.mcp_program == entry.command && self.mcp_connection.is_some();
+                        let (response, ()) = chrome::card_button(ui, ("ai-server", index), |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                // The pill is laid out first because a
+                                // truncating label claims whatever width is
+                                // left, and a server name long enough to
+                                // truncate would otherwise push the status
+                                // clean off the right edge of the card.
+                                if live {
+                                    chrome::pill(ui, "Connected", theme::good(ui));
+                                }
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(&entry.name)
+                                            .font(theme::card_title())
+                                            .strong(),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            ui.add(
+                                Label::new(
+                                    RichText::new(entry.command_line()).small().color(MUTED),
+                                )
+                                .truncate(),
+                            );
+                        });
+                        if response.pointer().clicked() {
+                            connect_to = Some((entry.command.clone(), entry.args.clone()));
+                        }
+                    }
+                    if shown == 0 {
+                        // An empty box under a heading reads as a loading
+                        // state, so say outright that there is nothing and
+                        // name the way forward.
+                        ui.add(
+                            Label::new(
+                                RichText::new(format!(
+                                    "No MCP servers are configured for {}.",
+                                    wanted.label()
+                                ))
+                                .strong(),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(theme::GAP_TIGHT);
+                        ui.add(
+                            Label::new(
+                                RichText::new(format!(
+                                    "Nothing was found in {}. Choose Custom above to point at a \
+                                     server yourself.",
+                                    wanted.origin()
+                                ))
+                                .small()
+                                .color(MUTED),
+                            )
+                            .wrap(),
+                        );
+                    }
+                }
+            }
+
+            // The warning stays in all three modes. A discovered row is read
+            // out of a file this app does not own, and clicking it still
+            // launches a program, which is exactly the risk a hand-typed path
+            // carries, so hiding the warning there would have it backwards.
+            ui.add_space(theme::GAP);
+            ui.add(
+                Label::new(
+                    RichText::new(
+                        "Only connect to a server you trust. Connecting starts that program on \
+                         this PC with these arguments. Its stdout is reserved for MCP messages.",
+                    )
+                    .small()
+                    .color(theme::warn(ui)),
+                )
+                .wrap(),
+            );
+            ui.add_space(theme::GAP);
+
+            ui.horizontal(|ui| {
+                let connected = self.mcp_connection.is_some();
+                let can_connect = !connected && !self.mcp_program.trim().is_empty();
+                let connect = ui
+                    .add_enabled_ui(can_connect, |ui| {
+                        chrome::button(ui, chrome::Weight::Primary, None, "Connect", accent)
+                    })
+                    .inner;
+                if connect.pointer().clicked() && can_connect {
                     let args = self
                         .mcp_args
                         .lines()
@@ -5085,18 +6503,14 @@ impl App {
                         .filter(|line| !line.is_empty())
                         .map(str::to_string)
                         .collect();
-                    self.mcp_connection = Some(crate::mcp_client::Connection::start(
-                        self.mcp_program.trim().to_string(),
-                        args,
-                    ));
-                    self.mcp_status = "Starting server and requesting its tools…".into();
-                    self.mcp_server = None;
-                    self.mcp_tools.clear();
+                    connect_to = Some((self.mcp_program.trim().to_string(), args));
                 }
-                if ui
-                    .add_enabled(connected, Button::new("Disconnect"))
-                    .clicked()
-                {
+                let disconnect = ui
+                    .add_enabled_ui(connected, |ui| {
+                        chrome::button(ui, chrome::Weight::Ghost, None, "Disconnect", accent)
+                    })
+                    .inner;
+                if disconnect.pointer().clicked() && connected {
                     if let Some(mut connection) = self.mcp_connection.take() {
                         connection.disconnect();
                     }
@@ -5104,25 +6518,46 @@ impl App {
                     self.mcp_server = None;
                     self.mcp_tools.clear();
                 }
-                ui.label(RichText::new(&self.mcp_status).color(if self.mcp_status.starts_with("Connection failed") {
+                let status_color = if self.mcp_status.starts_with("Connection failed") {
                     theme::bad(ui)
                 } else if self.mcp_status.starts_with("Connected") {
                     theme::good(ui)
                 } else {
                     MUTED
-                }));
+                };
+                ui.add(Label::new(RichText::new(&self.mcp_status).color(status_color)).truncate());
             });
         });
+
+        if let Some((program, args)) = connect_to {
+            // Picking a discovered row fills the Custom fields too, so
+            // switching to Custom shows what is actually running rather than
+            // whatever happened to be typed there last.
+            self.mcp_program = program.clone();
+            self.mcp_args = args.join("\n");
+            if let Some(mut previous) = self.mcp_connection.take() {
+                previous.disconnect();
+            }
+            self.mcp_connection = Some(crate::mcp_client::Connection::start(program, args));
+            self.mcp_status = "Starting server and requesting its tools…".into();
+            self.mcp_server = None;
+            self.mcp_tools.clear();
+        }
 
         if let Some((name, version)) = &self.mcp_server {
             ui.add_space(theme::GAP);
             theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-                ui.label(RichText::new(name).font(theme::section_title()).strong());
-                ui.label(
-                    RichText::new(format!("Version {version}"))
-                        .small()
-                        .color(MUTED),
+                ui.set_width(ui.available_width());
+                ui.add(
+                    Label::new(RichText::new(name).font(theme::card_title()).strong()).truncate(),
+                );
+                ui.add(
+                    Label::new(
+                        RichText::new(format!("Version {version}"))
+                            .small()
+                            .color(MUTED),
+                    )
+                    .truncate(),
                 );
                 ui.add_space(theme::GAP);
                 ui.label(RichText::new("Available tools").strong());
@@ -5133,9 +6568,12 @@ impl App {
                 }
                 for tool in &self.mcp_tools {
                     ui.separator();
-                    ui.label(RichText::new(&tool.name).strong());
+                    ui.add(Label::new(RichText::new(&tool.name).strong()).truncate());
                     if !tool.description.is_empty() {
-                        ui.label(RichText::new(&tool.description).small().color(MUTED));
+                        ui.add(
+                            Label::new(RichText::new(&tool.description).small().color(MUTED))
+                                .wrap(),
+                        );
                     }
                 }
                 if self.mcp_tools.len() == 256 {
@@ -5148,75 +6586,140 @@ impl App {
             });
         }
 
+        self.ai_discovered = Some(discovered);
+
         if self.mcp_status.starts_with("Starting") {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
     }
 
-    fn page_about(&mut self, ui: &mut Ui) {
+    fn page_settings(&mut self, ui: &mut Ui) {
         let accent = theme::accent_on(ui, self.accent);
-        theme::card(ui).show(ui, |ui| {
+        // Three unrelated subjects stacked down one scroll was the previous
+        // shape, and the separator between them was doing more work than a
+        // rule can. Switching between them costs a click and makes each one
+        // a page that fits on screen.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            for view in SettingsView::ALL {
+                if chrome::segment(ui, view.label(), self.settings_view == view, accent)
+                    .pointer()
+                    .clicked()
+                {
+                    self.settings_view = view;
+                }
+            }
+        });
+        ui.add_space(theme::GAP_SECTION);
+
+        match self.settings_view {
+            SettingsView::Appearance => {
+                let changed = self
+                    .appearance
+                    .page(ui, &mut self.settings, &mut self.accent);
+                if changed {
+                    self.settings.save();
+                    self.appearance.apply(ui.ctx(), &self.settings, self.accent);
+                }
+            }
+            SettingsView::Connections => self.ai_connections_section(ui),
+            SettingsView::About => self.about_section(ui),
+        }
+    }
+
+    fn about_section(&mut self, ui: &mut Ui) {
+        let accent = theme::accent_on(ui, self.accent);
+        theme::widget(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new("Windows Wrenchmaster").font(theme::section_title()).strong());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Windows Wrenchmaster")
+                        .font(theme::section_title())
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    chrome::pill(ui, &format!("v{}", env!("CARGO_PKG_VERSION")), accent);
+                });
+            });
             ui.label(
-                RichText::new(format!(
-                    "Version {} — offline build, Rust + egui",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .color(MUTED),
-            );
-            ui.add_space(theme::GAP);
-            ui.label(
-                "A rebuild of a VB.NET WinForms tool from 2017: a splash screen that phoned a \
-                 license server, a tabbed window of mostly unimplemented buttons, and a Clean \
-                 button that walked C:\\ deleting every .log file it could reach.",
-            );
-            ui.add_space(theme::GAP);
-            ui.label(RichText::new("What changed").strong());
-            ui.add_space(theme::GAP_TIGHT);
-            for line in [
-                "No network at all: no license server, no avatar fetch, no update check.",
-                "The cleaner works from a fixed list of known caches and always measures first.",
-                "Dry run is the default, and a real delete asks once before it runs.",
-                "Scanning and deleting run on a worker thread, with a cancel button.",
-                "Every tweak reads its registry value; removing it clears the value Wrenchmaster manages, but does not recover prior custom data.",
-                "System info comes from the registry, so no WMI error dialogs.",
-                "Failures land in the status bar instead of an empty Catch block.",
-            ] {
-                ui.label(format!("• {line}"));
-            }
-            ui.add_space(theme::GAP);
-            ui.label(RichText::new("Changelog").strong());
-            ui.add_space(theme::GAP_TIGHT);
-            for (version, note) in [
-                (
-                    "v2.0",
-                    "Rewritten in Rust as an offline tool: working cleaner, reversible tweaks, \
-                     repair commands, registry export and restore points.",
-                ),
-                (
-                    "v0.9",
-                    "Last VB.NET build. License check against a remote server, log cleaner, \
-                     seven tabs with six of them placeholders.",
-                ),
-                (
-                    "v0.1",
-                    "First version, as recorded in the original Changelog.txt.",
-                ),
-            ] {
-                ui.label(RichText::new(version).strong().color(accent));
-                ui.label(RichText::new(note).small().color(MUTED));
-                ui.add_space(theme::GAP_TIGHT);
-            }
-            ui.add_space(theme::GAP);
-            ui.label(
-                RichText::new(
-                    "Deletes are permanent. Explicit registry changes may replace a custom value; removing the Wrenchmaster policy value does not restore prior data. Create a restore point before broad changes.",
-                )
-                .small()
-                .color(MUTED),
+                RichText::new("Offline Windows maintenance. Rust and egui, no network.")
+                    .small()
+                    .color(MUTED),
             );
         });
+
+        ui.add_space(theme::GAP);
+        theme::widget(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("CHANGELOG")
+                    .font(theme::eyebrow())
+                    .color(theme::muted(ui)),
+            );
+            ui.add_space(theme::GAP_TIGHT);
+            // One line each. The long-form history of the 2017 VB.NET build
+            // that this replaces was interesting to write and is of no use to
+            // anyone reading the About page to find out what version they are
+            // running.
+            for (version, note) in [
+                (
+                    "2.0",
+                    "Rewritten in Rust. Offline, reversible tweaks, worker-thread cleaner.",
+                ),
+                ("0.9", "Last VB.NET build."),
+                ("0.1", "First version."),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(version)
+                            .font(theme::readout())
+                            .strong()
+                            .color(accent),
+                    );
+                    ui.add(Label::new(RichText::new(note).small().color(MUTED)).truncate());
+                });
+            }
+        });
+
+        ui.add_space(theme::GAP);
+        theme::widget(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(chrome::icon_text(chrome::icon::HEART, 15.0, accent));
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Support the project").font(theme::card_title()));
+                    ui.label(
+                        RichText::new("Free and offline. Nothing to unlock.")
+                            .small()
+                            .color(MUTED),
+                    );
+                });
+                // The only outbound link in the app, and it opens in the
+                // browser rather than fetching anything. A click the user
+                // made is not the app phoning home, which is the promise the
+                // rest of the build keeps.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if chrome::button(ui, chrome::Weight::Ghost, None, "Patreon", accent)
+                        .pointer()
+                        .clicked()
+                    {
+                        match crate::util::shell_open(PATREON_URL) {
+                            Ok(()) => self.say("Opened Patreon in your browser."),
+                            Err(error) => {
+                                self.complain(format!("Could not open the browser: {error}"))
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        ui.add_space(theme::GAP);
+        ui.label(
+            RichText::new("Deletes are permanent. Create a restore point before broad changes.")
+                .small()
+                .color(theme::warn(ui)),
+        );
     }
 }
 
@@ -5354,58 +6857,58 @@ fn draw_hardware_sensor_rows(ui: &mut Ui, readings: &[&HardwareSensorReading], e
         .num_columns(3)
         .spacing([18.0, 6.0])
         .show(ui, |ui| {
-        for (index, reading) in supported.into_iter().enumerate() {
-            let number = reading.value.trim().parse::<f32>().ok();
-            let units = match reading.sensor_type.as_str() {
-                "Temperature" => " °C".to_string(),
-                _ if reading.unit.is_empty() => String::new(),
-                // Anything the provider sent that did not survive decoding is
-                // dropped rather than drawn as a box.
-                _ if reading.unit.contains('�') => String::new(),
-                _ => format!(" {}", reading.unit),
-            };
+            for (index, reading) in supported.into_iter().enumerate() {
+                let number = reading.value.trim().parse::<f32>().ok();
+                let units = match reading.sensor_type.as_str() {
+                    "Temperature" => " °C".to_string(),
+                    _ if reading.unit.is_empty() => String::new(),
+                    // Anything the provider sent that did not survive decoding is
+                    // dropped rather than drawn as a box.
+                    _ if reading.unit.contains('�') => String::new(),
+                    _ => format!(" {}", reading.unit),
+                };
 
-            // Temperature is the reading worth colouring: it is the one that
-            // says whether the machine is in trouble. Fans and load get the
-            // accent and a bar; volts and watts have no meaningful ceiling to
-            // draw a bar against, so they stay plain.
-            let (color, fraction) = match reading.sensor_type.as_str() {
-                "Temperature" => match number {
-                    Some(c) => (chrome::temp_color(ui, c), Some(chrome::temp_fraction(c))),
-                    None => (MUTED, None),
-                },
-                "Fan" | "Load" => (
-                    ACCENT,
-                    number.filter(|_| reading.unit == "%").map(|v| v / 100.0),
-                ),
-                _ => (MUTED, None),
-            };
+                // Temperature is the reading worth colouring: it is the one that
+                // says whether the machine is in trouble. Fans and load get the
+                // accent and a bar; volts and watts have no meaningful ceiling to
+                // draw a bar against, so they stay plain.
+                let (color, fraction) = match reading.sensor_type.as_str() {
+                    "Temperature" => match number {
+                        Some(c) => (chrome::temp_color(ui, c), Some(chrome::temp_fraction(c))),
+                        None => (MUTED, None),
+                    },
+                    "Fan" | "Load" => (
+                        ACCENT,
+                        number.filter(|_| reading.unit == "%").map(|v| v / 100.0),
+                    ),
+                    _ => (MUTED, None),
+                };
 
-            let shown = match number {
-                Some(v) if v.fract() == 0.0 => format!("{v:.0}"),
-                Some(v) => format!("{v:.1}"),
-                None => reading.value.clone(),
-            };
-            chrome::sensor_chip(
-                ui,
-                &reading.sensor_name,
-                &format!("{shown}{units}"),
-                color,
-                fraction,
-            )
-            .on_hover_text(format!(
-                "{} · {} · {} (owned by {} · {})",
-                reading.sensor_type,
-                reading.hardware_type,
-                reading.hardware_name,
-                reading.parent_type,
-                reading.parent_name
-            ));
-            if (index + 1) % 3 == 0 {
-                ui.end_row();
+                let shown = match number {
+                    Some(v) if v.fract() == 0.0 => format!("{v:.0}"),
+                    Some(v) => format!("{v:.1}"),
+                    None => reading.value.clone(),
+                };
+                chrome::sensor_chip(
+                    ui,
+                    &reading.sensor_name,
+                    &format!("{shown}{units}"),
+                    color,
+                    fraction,
+                )
+                .on_hover_text(format!(
+                    "{} · {} · {} (owned by {} · {})",
+                    reading.sensor_type,
+                    reading.hardware_type,
+                    reading.hardware_name,
+                    reading.parent_type,
+                    reading.parent_name
+                ));
+                if (index + 1) % 3 == 0 {
+                    ui.end_row();
+                }
             }
-        }
-    });
+        });
 }
 
 fn size_folder_contains(
@@ -5425,24 +6928,28 @@ fn size_folder_contains(
 }
 
 fn draw_diagnostic_event(ui: &mut Ui, index: usize, finding: &EventFinding) {
-    egui::CollapsingHeader::new(format!(
-        "{} · Event {} · {}",
-        finding.source, finding.event_id, finding.time
-    ))
     // The position in the list is what makes this unique. Windows really does
     // log the same source, event id and timestamp more than once, and keying
     // only on those made two rows share an id -- which egui reports by painting
     // "First/Second use of widget ID" over the page.
-    .id_salt((
-        "diagnostic-event",
-        index,
-        &finding.source,
-        finding.event_id,
-        &finding.time,
-    ))
-    .show(ui, |ui| {
-        ui.label(RichText::new(&finding.message).small());
-    });
+    let _ = chrome::accordion(
+        ui,
+        (
+            "diagnostic-event",
+            index,
+            &finding.source,
+            finding.event_id,
+            &finding.time,
+        ),
+        &format!(
+            "{} · Event {} · {}",
+            finding.source, finding.event_id, finding.time
+        ),
+        false,
+        |ui| {
+            ui.label(RichText::new(&finding.message).small());
+        },
+    );
 }
 
 fn tool_icon(name: &str) -> &'static str {
@@ -5487,39 +6994,136 @@ fn shorten(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-/// One live reading: name, figure, gauge, caption.
+/// One live reading: name, figure, trace, caption.
 ///
 /// Every card in the Overview row is built from this, which is why they line
-/// up -- they are the same shape, rather than three different shapes pinned to
+/// up -- they are the same shape, rather than four different shapes pinned to
 /// the same height. Change the shape here and the row stays aligned.
+///
+/// The order is deliberate. The name is an eyebrow, small and grey; the
+/// figure is the headline; the chart takes the width underneath it. A card
+/// whose title is the biggest thing on it is a card you have to read before
+/// you can use, and these are meant to be glanced at.
 fn reading_card(
     ui: &mut Ui,
     name: &str,
     value: &str,
     color: Color32,
+    status: &str,
     fraction: f32,
     caption: &str,
     trend: Option<&[f32]>,
 ) {
-    theme::card(ui).show(ui, |ui| {
+    theme::widget(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new(name).small().color(MUTED));
+        ui.set_min_height(162.0);
+        ui.horizontal(|ui| {
+            let icon = match name {
+                "Processor" => chrome::icon::DEVICES,
+                "Graphics" => chrome::icon::CHART,
+                "Memory" => chrome::icon::MEMORY,
+                _ => chrome::icon::STORAGE,
+            };
+            ui.label(chrome::icon_text(icon, 13.0, color));
+            ui.add(
+                Label::new(
+                    RichText::new(name)
+                        .font(theme::eyebrow())
+                        .color(theme::muted(ui)),
+                )
+                .truncate(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                chrome::pill(ui, status, color);
+            });
+        });
+        ui.add_space(theme::GAP_TIGHT);
         ui.label(
             RichText::new(value)
                 .font(theme::readout_large())
                 .color(color),
         );
+        ui.add_space(theme::GAP_TIGHT);
         match trend {
             // Where there is history, the shape of the last few minutes says
             // more than the bar: it separates "busy" from "spiking".
             Some(values) if values.len() >= 2 => {
                 chrome::sparkline(ui, values, color, 100.0);
-                ui.label(RichText::new(caption).small().color(MUTED));
+                ui.add_space(theme::GAP_TIGHT);
+                ui.add(Label::new(RichText::new(caption).small().color(MUTED)).truncate());
             }
-            _ => {
-                chrome::gauge(ui, fraction, color, Some(caption), 0.9);
+            // A card that is going to carry a chart keeps the chart's space
+            // from the first frame. Falling back to the bar meant the three
+            // live cards opened as meters and swapped to sparklines a second
+            // or two later, which read as a glitch rather than as data
+            // arriving.
+            Some(_) => {
+                chrome::sparkline(ui, &[], color, 100.0);
+                ui.add_space(theme::GAP_TIGHT);
+                ui.add(
+                    Label::new(
+                        RichText::new("Collecting\u{2026}")
+                            .small()
+                            .color(theme::faint(ui)),
+                    )
+                    .truncate(),
+                );
+            }
+            None => {
+                chrome::meter(ui, fraction, color, Some(caption));
             }
         }
+    });
+}
+
+/// A compact status tile for a measured part of the system.
+///
+/// The figure carries the state; the short caption explains what it means.
+/// This keeps the first pass over a health check readable while leaving the
+/// detailed readings available below.
+///
+/// Same hierarchy as `reading_card`: eyebrow, figure, scale, caption. The two
+/// appear on different pages but within sight of each other in the same
+/// session, so they are built to the same proportions.
+fn metric_widget(
+    ui: &mut Ui,
+    icon: &str,
+    title: &str,
+    value: &str,
+    status: &str,
+    detail: &str,
+    fraction: Option<f32>,
+    color: Color32,
+) {
+    theme::widget(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_min_height(162.0);
+        ui.horizontal(|ui| {
+            ui.label(chrome::icon_text(icon, 13.0, color));
+            ui.add(
+                Label::new(
+                    RichText::new(title)
+                        .font(theme::eyebrow())
+                        .color(theme::muted(ui)),
+                )
+                .truncate(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                chrome::pill(ui, status, color);
+            });
+        });
+        ui.add_space(theme::GAP_TIGHT);
+        ui.label(
+            RichText::new(value)
+                .font(theme::readout_large())
+                .color(color),
+        );
+        if let Some(fraction) = fraction {
+            ui.add_space(theme::GAP_TIGHT);
+            chrome::meter(ui, fraction.clamp(0.0, 1.0), color, None);
+        }
+        ui.add_space(theme::GAP_TIGHT);
+        ui.add(Label::new(RichText::new(detail).small().color(MUTED)).wrap());
     });
 }
 
@@ -5533,9 +7137,10 @@ fn ghost(ui: &mut Ui, label: &str) -> egui::Response {
 /// A card that behaves as a link: the whole surface is the target, because a
 /// small button sitting inside a large card is the worst of both.
 fn link_card(ui: &mut Ui, glyph: &str, accent: Color32, title: &str, detail: &str) -> bool {
-    let card = theme::card(ui)
+    let card = theme::widget(ui)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.set_min_height(78.0);
             ui.horizontal(|ui| {
                 ui.label(chrome::icon_text(glyph, 22.0, accent));
                 ui.add_space(theme::GAP_TIGHT);
@@ -5550,7 +7155,7 @@ fn link_card(ui: &mut Ui, glyph: &str, accent: Color32, title: &str, detail: &st
     if card.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    card.clicked()
+    card.pointer().clicked()
 }
 
 /// A paragraph of explanation, held to a readable measure. Body text set to

@@ -248,18 +248,21 @@ pub fn relaunch_elevated() -> std::io::Result<()> {
 /// because the button that calls it has to say so too.
 pub fn run_activation_scripts() -> std::io::Result<()> {
     let mut cmd = Command::new(powershell_path());
+    // A visible console, and not `-NonInteractive`. MAS is a menu the user
+    // has to answer; run hidden and non-interactive, as it was, the script
+    // reaches its first prompt, finds no console to read from and dies. The
+    // app then reported that it had started it and nothing ever happened.
     cmd.args([
         "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
         "-Command",
         "irm 'https://get.activated.win' | iex".into(),
     ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(CREATE_NEW_CONSOLE);
     }
     cmd.spawn().map(|_| ())
 }

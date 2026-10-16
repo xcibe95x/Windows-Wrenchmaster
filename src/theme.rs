@@ -1,27 +1,13 @@
-//! Visual identity: a bench instrument, not a dashboard.
+//! Visual system for a modern system-analytics dashboard.
 //!
-//! The brief this is built to: someone is standing in front of a machine that
-//! is misbehaving and needs to read its condition and act on it. So the look is
-//! borrowed from measuring equipment rather than from web apps.
+//! The interface should explain machine state at a glance, then reveal detail
+//! only where it helps. Reusable widgets carry the live metrics, panels group
+//! related controls or findings, and flat rows keep long lists scannable.
 //!
-//! Three rules hold the whole thing together.
-//!
-//! 1. Colour means state. Green, amber and red are indicator lamps and are
-//!    never spent on decoration, which is why the chassis is a neutral
-//!    graphite: it gives the eye nothing to look at until something is wrong.
-//! 2. Every number is a measurement, so numbers are set in a monospace face.
-//!    This is not a stylistic tic -- readings refresh while you watch them, and
-//!    proportional digits change width as they change value, so a figure
-//!    jitters in place and is hard to compare down a column. Tabular figures
-//!    hold still.
-//! 3. Surfaces earn their weight. A raised panel means a readout you are meant
-//!    to read; a hairline row means a list you are meant to scan. One corner
-//!    radius on everything flattens that distinction, so there are two.
-//!
-//! The accent is the one hue that moves: `machine::Era` supplies the colour of
-//! the Windows generation underneath, so the app is tinted by the OS it is
-//! managing. A neutral chassis is what lets that work -- the blue-tinted ground
-//! this replaces only ever flattered a blue accent.
+//! Semantic colors communicate normal, attention, and problem states. The
+//! accent remains Windows-generation-aware, while the existing dark and light
+//! palettes provide the surfaces and text contrast. Measurements use tabular
+//! figures so values remain easy to compare as they update.
 
 use egui::{
     Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, Style, TextStyle, Theme,
@@ -33,12 +19,44 @@ use egui::{
 pub const ACCENT: Color32 = Color32::from_rgb(0x4D, 0xA3, 0xFF);
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x2B, 0x5E, 0x9E);
 
-/// Indicator lamps, held just off full saturation so a row of them reads as
-/// instrumentation rather than confectionery, and so amber and red stay
-/// distinguishable from one another at small sizes.
+/// Semantic indicator colors, held just off full saturation so green, amber,
+/// and red remain distinct in compact status chips and charts.
 pub const GOOD: Color32 = Color32::from_rgb(0x5F, 0xA9, 0x74);
 pub const WARN: Color32 = Color32::from_rgb(0xD9, 0x9A, 0x2B);
 pub const BAD: Color32 = Color32::from_rgb(0xD2, 0x56, 0x4F);
+
+/// The chart palette. Data series need hues that stay apart from each other
+/// *and* from the semantic three above, so a line is never mistaken for a
+/// warning. These are high-chroma on purpose: on a near-black card a muted
+/// line disappears, and the whole point of a chart is that the shape reads
+/// from across the desk.
+pub const CYAN: Color32 = Color32::from_rgb(0x22, 0xD3, 0xEE);
+pub const VIOLET: Color32 = Color32::from_rgb(0xA8, 0x7B, 0xFA);
+pub const MAGENTA: Color32 = Color32::from_rgb(0xF0, 0x59, 0xA6);
+pub const AMBER: Color32 = Color32::from_rgb(0xFA, 0xCC, 0x15);
+pub const EMERALD: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99);
+pub const TANGERINE: Color32 = Color32::from_rgb(0xFB, 0x92, 0x3C);
+
+const SERIES: [Color32; 6] = [CYAN, VIOLET, AMBER, EMERALD, MAGENTA, TANGERINE];
+
+/// The nth series colour, wrapped. Charts index into this rather than picking
+/// a colour each, so two charts on a page agree about what the second line
+/// looks like.
+pub fn series(ui: &egui::Ui, index: usize) -> Color32 {
+    let base = SERIES[index % SERIES.len()];
+    if ui.visuals().dark_mode {
+        base
+    } else {
+        // The same hues taken down for a light ground, where full chroma on
+        // near-white is both glaring and short of contrast for a 1px line.
+        let [r, g, b, _] = base.to_array();
+        Color32::from_rgb(
+            (r as f32 * 0.62) as u8,
+            (g as f32 * 0.58) as u8,
+            (b as f32 * 0.62) as u8,
+        )
+    }
+}
 
 pub const TEXT: Color32 = Color32::from_rgb(0xDD, 0xE4, 0xEE);
 /// Mid tones, picked to stay legible against both the dark chassis and the
@@ -130,12 +148,16 @@ const L_TEXT: Color32 = Color32::from_rgb(0x13, 0x23, 0x2B);
 /// shape, controls the tighter one.
 const PANEL_RADIUS: CornerRadius = CornerRadius::same(6);
 const CONTROL_RADIUS: CornerRadius = CornerRadius::same(5);
+/// Analytics widgets take a noticeably softer corner than panels do. The
+/// chart cards are the thing you look at first, and the rounder shape is what
+/// separates them from the bordered panels of text below.
+pub const WIDGET_RADIUS: CornerRadius = CornerRadius::same(14);
 
 /// Vertical rhythm. Three steps, used in place of ad-hoc numbers: inside a
 /// group, between groups, between sections.
 pub const GAP_TIGHT: f32 = 4.0;
-pub const GAP: f32 = 10.0;
-pub const GAP_SECTION: f32 = 18.0;
+pub const GAP: f32 = 8.0;
+pub const GAP_SECTION: f32 = 16.0;
 
 // --------------------------------------------------------------- type scale
 
@@ -151,6 +173,13 @@ pub fn section_title() -> FontId {
 
 pub fn card_title() -> FontId {
     FontId::new(13.5, FontFamily::Proportional)
+}
+
+/// The quiet line naming a widget, set above the figure it belongs to. Small
+/// and unemphasised on purpose: on a chart card the data is the headline and
+/// the title is the caption, not the other way round.
+pub fn eyebrow() -> FontId {
+    FontId::new(11.5, FontFamily::Proportional)
 }
 
 /// A measurement. Monospace for tabular figures; see rule 2 above.
@@ -214,7 +243,15 @@ fn shape(style: &mut Style) {
     style.spacing.item_spacing = egui::vec2(10.0, 7.0);
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.spacing.window_margin = Margin::same(14);
-    style.spacing.scroll.bar_width = 9.0;
+    style.spacing.scroll = egui::style::ScrollStyle {
+        dormant_handle_opacity: 0.0,
+        active_handle_opacity: 0.0,
+        interact_handle_opacity: 0.0,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        ..egui::style::ScrollStyle::floating()
+    };
     style.spacing.indent = 20.0;
 }
 
@@ -283,7 +320,7 @@ fn shaped(mut visuals: Visuals) -> Visuals {
     visuals
 }
 
-/// A readout panel: raised off the chassis, for figures meant to be read.
+/// A grouped content panel for long-form details, controls, and lists.
 ///
 /// Reads its colours from the active visuals rather than the dark constants,
 /// which is what the light theme needs -- hardcoding them left every card dark
@@ -294,7 +331,28 @@ pub fn card(ui: &egui::Ui) -> egui::Frame {
         .fill(visuals.bg_fill)
         .stroke(Stroke::new(1.0, visuals.bg_stroke.color))
         .corner_radius(PANEL_RADIUS)
-        .inner_margin(Margin::same(13))
+        .inner_margin(Margin::same(12))
+}
+
+/// A compact analytics widget. Its raised fill distinguishes a focused
+/// measurement from the quieter, bordered panels used for longer content.
+/// Colors come from the active theme so the light palette stays coherent.
+pub fn widget(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(ui.visuals().widgets.inactive.bg_fill)
+        .corner_radius(WIDGET_RADIUS)
+        .inner_margin(Margin::same(18))
+}
+
+/// The track a meter, ring, or chart floor is drawn on: the card's own fill
+/// stepped away from, not `extreme_bg_color`. At chart size that near-black
+/// read as a hole punched in the card.
+pub fn track(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(0x2E, 0x39, 0x4A)
+    } else {
+        Color32::from_rgb(0xBD, 0xD1, 0xD9)
+    }
 }
 
 /// A list row: no fill, no border, separated by its hairline alone. For things
@@ -303,7 +361,7 @@ pub fn card(ui: &egui::Ui) -> egui::Frame {
 pub fn row(_ui: &egui::Ui) -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::TRANSPARENT)
-        .inner_margin(Margin::symmetric(2, 7))
+        .inner_margin(Margin::symmetric(4, 8))
 }
 
 /// The flat fill used by the sidebar and the status bar.

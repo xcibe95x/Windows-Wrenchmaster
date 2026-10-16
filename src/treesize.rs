@@ -90,6 +90,11 @@ impl Ord for LargestFile {
 
 const LARGEST_FILES_LIMIT: usize = 200;
 
+/// How often a partial tree is handed to the UI. Each one costs a clone of
+/// the folder list plus a sort, so it is paced slow enough not to compete
+/// with the walk and fast enough that the view visibly grows.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(600);
+
 #[derive(Clone, Debug, Default)]
 pub struct ScanProgress {
     pub visited_entries: usize,
@@ -144,6 +149,16 @@ impl std::error::Error for ScanError {}
 #[derive(Debug)]
 pub enum ScanMessage {
     Progress(ScanProgress),
+    /// A usable tree built from everything walked so far, sent every
+    /// `SNAPSHOT_INTERVAL` while the scan runs.
+    ///
+    /// A scan of a large drive takes long enough that counters ticking up
+    /// behind a spinner feel like nothing is happening. The folders already
+    /// measured are genuinely useful before the rest arrive -- the biggest
+    /// one is usually visible within the first second -- so they are handed
+    /// over as they are, and the view fills in rather than appearing at the
+    /// end. Totals in a partial tree only ever grow.
+    Partial(ScanResult),
     Finished(Result<ScanResult, ScanError>),
 }
 
@@ -228,6 +243,7 @@ fn scan(
         omitted_errors: 0,
     };
     let mut last_report = Instant::now();
+    let mut last_snapshot = Instant::now();
     // A min-heap retains only the largest N entries seen so far.
     let mut largest_files: BinaryHeap<Reverse<LargestFile>> = BinaryHeap::new();
 
@@ -325,12 +341,38 @@ fn scan(
             let _ = tx.send(ScanMessage::Progress(result.progress.clone()));
             last_report = Instant::now();
         }
+
+        if last_snapshot.elapsed() >= SNAPSHOT_INTERVAL {
+            // Rolled up on a copy, never on the live tree: `summarise` adds
+            // each folder's total into its parent, so running it twice over
+            // the same nodes would count every byte twice.
+            let mut snapshot = result.clone();
+            snapshot.largest_files = largest_files
+                .iter()
+                .map(|Reverse(file)| file.clone())
+                .collect();
+            summarise(&mut snapshot);
+            let _ = tx.send(ScanMessage::Partial(snapshot));
+            last_snapshot = Instant::now();
+        }
     }
 
     result.largest_files = largest_files
         .into_iter()
         .map(|Reverse(file)| file)
         .collect();
+    summarise(&mut result);
+    let _ = tx.send(ScanMessage::Progress(result.progress.clone()));
+    Ok(result)
+}
+
+/// Turn a freshly walked tree into one the UI can draw: subtree totals rolled
+/// up, largest files in order, and each folder's children listed biggest
+/// first. Shared by the partial snapshots and the final result, so a tree
+/// that arrives mid-scan is laid out exactly like the one that ends it.
+///
+/// Not idempotent -- see the caller's note about rolling up a copy.
+fn summarise(result: &mut ScanResult) {
     result
         .largest_files
         .sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
@@ -356,8 +398,6 @@ fn scan(
                 })
         });
     }
-    let _ = tx.send(ScanMessage::Progress(result.progress.clone()));
-    Ok(result)
 }
 
 fn retain_largest_file(heap: &mut BinaryHeap<Reverse<LargestFile>>, file: LargestFile) {

@@ -133,14 +133,21 @@ fn connect_and_list(
     ),
     String,
 > {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // MCP stdio reserves stdout for protocol messages. Suppress stderr so
+        // a noisy server cannot block on an unread pipe.
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     let mut child = KillOnDrop(Some(
-        Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // MCP stdio reserves stdout for protocol messages. Suppress stderr so
-            // a noisy server cannot block on an unread pipe.
-            .stderr(Stdio::null())
+        command
             .spawn()
             .map_err(|error| format!("Could not start MCP server: {error}"))?,
     ));

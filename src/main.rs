@@ -2,8 +2,10 @@
 // No console window in release; the GUI is the whole program.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai_config;
 mod app;
 mod app_residue;
+mod appearance;
 mod chrome;
 mod cleaner;
 mod diagnose;

@@ -57,6 +57,36 @@ pub mod icon {
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
 }
 
+/// The pointing-hand cursor, as a one-call suffix on any response.
+///
+/// Windows uses the arrow for everything and leaves it to the visual design
+/// to say what is clickable, which works for a button and does not work for
+/// the things this app also makes interactive: whole cards, list rows, chart
+/// range chips, accordion headers. Rather than remember per widget, every
+/// interaction ends in `.pointer()` before its `.clicked()`.
+///
+/// Calling it twice is harmless -- the cursor is set per frame and the last
+/// write wins with the same value -- so the house widgets set it themselves
+/// and call sites may set it again without having to know.
+pub trait Pointer {
+    /// Show the pointing hand while this widget is hovered and enabled.
+    ///
+    /// Borrows rather than consumes, because plenty of call sites go on to
+    /// ask the same response for something else afterwards.
+    fn pointer(&self) -> &Self;
+}
+
+impl Pointer for Response {
+    fn pointer(&self) -> &Self {
+        // A disabled control is deliberately not inviting a click, and
+        // offering the hand would contradict the greyed-out styling.
+        if self.hovered() && self.enabled() {
+            self.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        self
+    }
+}
+
 pub const TITLE_BAR_HEIGHT: f32 = 44.0;
 const RESIZE_MARGIN: f32 = 6.0;
 
@@ -159,6 +189,15 @@ pub fn icon_text(glyph: &str, size: f32, color: Color32) -> RichText {
     RichText::new(glyph).font(icon_font(size)).color(color)
 }
 
+/// Standard page section heading: one icon and one title, aligned consistently
+/// across analytics panels.
+pub fn section_heading(ui: &mut Ui, glyph: &str, title: &str, accent: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(icon_text(glyph, 18.0, accent));
+        ui.label(RichText::new(title).font(theme::section_title()).strong());
+    });
+}
+
 /// Decode the official logo and apply the same 8 px radius it has at 32 px.
 /// The mask is alpha-only, so the source artwork and colors remain untouched.
 pub fn official_icon_rgba() -> (u32, u32, Vec<u8>) {
@@ -187,12 +226,14 @@ pub fn official_icon_rgba() -> (u32, u32, Vec<u8>) {
 /// What the user did on the title bar this frame.
 pub struct TitleBarResult {
     pub close_requested: bool,
+    pub elevation_requested: bool,
 }
 
-/// Draw the title bar: wordmark on the left, window buttons on the right.
+/// Draw the title bar: app name and privilege status on the left, window buttons on the right.
 /// The open space remains a drag surface.
-pub fn title_bar(ui: &mut Ui, subtitle: &str) -> TitleBarResult {
+pub fn title_bar(ui: &mut Ui, elevated: bool) -> TitleBarResult {
     let mut close_requested = false;
+    let mut elevation_requested = false;
     let height = ui.available_height();
     let full = ui.available_rect_before_wrap();
 
@@ -211,37 +252,62 @@ pub fn title_bar(ui: &mut Ui, subtitle: &str) -> TitleBarResult {
     let left = Rect::from_min_size(full.min + vec2(16.0, 0.0), vec2(320.0, height));
     ui.scope_builder(UiBuilder::new().max_rect(left), |ui| {
         ui.horizontal_centered(|ui| {
-            // Keyed by theme: the lettering is near-white, so the light theme
-            // needs the recoloured copy or the title bar reads as empty.
-            let dark = ui.visuals().dark_mode;
-            let texture_id = Id::new(("wrenchmaster-wordmark-titlebar", dark));
-            let wordmark = if let Some(texture) = ui
+            // Keep the rounded app icon visible beside the app name.
+            let icon_id = Id::new("wrenchmaster-official-titlebar-icon");
+            let app_icon = if let Some(texture) = ui
                 .ctx()
-                .data(|data| data.get_temp::<egui::TextureHandle>(texture_id))
+                .data(|data| data.get_temp::<egui::TextureHandle>(icon_id))
             {
                 texture
             } else {
+                let (icon_width, icon_height, rgba) = official_icon_rgba();
                 let texture = ui.ctx().load_texture(
-                    if dark { "wordmark-bar-dark" } else { "wordmark-bar-light" },
-                    wordmark_image(dark),
+                    "wrenchmaster-official-titlebar-icon",
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [icon_width as usize, icon_height as usize],
+                        &rgba,
+                    ),
                     egui::TextureOptions::LINEAR,
                 );
                 ui.ctx()
-                    .data_mut(|data| data.insert_temp(texture_id, texture.clone()));
+                    .data_mut(|data| data.insert_temp(icon_id, texture.clone()));
                 texture
             };
-            let source_size = wordmark.size_vec2();
-            let logo_height = height.min(34.0);
-            let logo_size = vec2(logo_height * source_size.x / source_size.y, logo_height);
-            let logo_rect = ui.allocate_space(logo_size).1;
+            let icon_size = 28.0;
+            let icon_rect = ui.allocate_space(vec2(icon_size, icon_size)).1;
             ui.painter().image(
-                wordmark.id(),
-                logo_rect,
+                app_icon.id(),
+                icon_rect,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-            ui.add_space(8.0);
-            ui.label(RichText::new(subtitle).size(12.0).color(theme::faint(ui)));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Wrenchmaster")
+                    .size(14.5)
+                    .strong()
+                    .color(theme::text(ui)),
+            );
+            ui.add_space(10.0);
+            if elevated {
+                ui.label(
+                    RichText::new("Administrator")
+                        .small()
+                        .color(theme::good(ui)),
+                );
+            } else {
+                elevation_requested = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new("Standard user")
+                                .small()
+                                .color(theme::warn(ui)),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Click to restart Wrenchmaster as administrator.")
+                    .clicked();
+            }
         });
     });
 
@@ -312,7 +378,10 @@ pub fn title_bar(ui: &mut Ui, subtitle: &str) -> TitleBarResult {
         Stroke::new(1.0, theme::line(ui)),
     );
 
-    TitleBarResult { close_requested }
+    TitleBarResult {
+        close_requested,
+        elevation_requested,
+    }
 }
 
 enum Action {
@@ -540,80 +609,135 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, accent: Color32) -> Response {
         rect.center().y,
     );
     painter.circle_filled(center, rect.height() * 0.5 - 3.0, knob);
+    response.pointer();
     response
 }
 
 /// A rounded meter. Replaces `egui::ProgressBar`, which is unmistakably stock.
+///
+/// There is deliberately no threshold mark on the scale. One was tried and
+/// cut a gap across the track near the right-hand end, which read as the bar
+/// being broken; and the fill already changes colour when the reading passes
+/// the point it stops being comfortable, so the mark only repeated it.
 pub fn meter(ui: &mut Ui, fraction: f32, color: Color32, label: Option<&str>) -> Response {
-    meter_inner(ui, fraction, color, label, None)
-}
+    // Chunky and fully pill-rounded. A hairline bar reads as a divider with
+    // some colour on it; at this weight the fill is an object on the card and
+    // the length is legible from across the room, which is the entire job.
+    let bar_height: f32 = if label.is_some() { 14.0 } else { 10.0 };
+    let fraction = fraction.clamp(0.0, 1.0);
 
-/// The same gauge with a limit drawn on the scale -- the point at which the
-/// reading stops being comfortable. Used where a threshold is real, so the
-/// colour change has something visible to change against.
-pub fn gauge(
-    ui: &mut Ui,
-    fraction: f32,
-    color: Color32,
-    label: Option<&str>,
-    limit: f32,
-) -> Response {
-    meter_inner(ui, fraction, color, label, Some(limit))
-}
+    // The label line carries the caption on the left and the reading on the
+    // right. The percentage is derived rather than passed: every caller
+    // already hands over the fraction, and a bar whose value you have to
+    // estimate off its length is a bar missing its most useful digit.
+    let value = label.map(|_| format!("{:.0}%", fraction * 100.0));
+    let font = FontId::proportional(11.5);
+    let painter = ui.painter().clone();
+    let value_galley = value
+        .as_ref()
+        .map(|value| painter.layout_no_wrap(value.clone(), font.clone(), color));
 
-fn meter_inner(
-    ui: &mut Ui,
-    fraction: f32,
-    color: Color32,
-    label: Option<&str>,
-    limit: Option<f32>,
-) -> Response {
-    let height = if label.is_some() { 30.0 } else { 8.0 };
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let line_height = value_galley.as_ref().map_or(0.0, |g| g.size().y + 6.0);
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), bar_height + line_height),
+        Sense::hover(),
+    );
     if !ui.is_rect_visible(rect) {
         return response;
     }
 
-    let fraction = fraction.clamp(0.0, 1.0);
-    let bar_height = 8.0_f32.min(rect.height());
-    // With a label the bar sits on the bottom edge, so the text above it has a
-    // line of its own; without one it is centred in the row it was given.
-    let bar_top = if label.is_some() {
-        rect.max.y - bar_height
-    } else {
-        rect.min.y + (rect.height() - bar_height) * 0.5
-    };
-    let bar = Rect::from_min_size(pos2(rect.min.x, bar_top), vec2(rect.width(), bar_height));
-    let painter = ui.painter();
-    let radius = CornerRadius::same((bar_height * 0.5) as u8);
-    painter.rect_filled(bar, radius, ui.visuals().extreme_bg_color);
-
-    if fraction > 0.0 {
-        let filled = Rect::from_min_size(bar.min, vec2(bar.width() * fraction, bar.height()));
-        painter.rect_filled(filled, radius, color);
-    }
-
-    if let Some(limit) = limit {
-        // A notch under the track, not a line through it: the limit marks the
-        // scale, so it must never be mistaken for part of the reading.
-        let x = bar.min.x + bar.width() * limit.clamp(0.0, 1.0);
-        painter.vline(
-            x,
-            bar.max.y..=(bar.max.y + 3.0),
-            Stroke::new(1.0, theme::faint(ui)),
-        );
-    }
-    if let Some(label) = label {
-        // Left, under the heading it belongs to. Right-aligned it drifted far
-        // from the bar on a full-width gauge and read as unrelated.
-        painter.text(
-            pos2(rect.min.x, rect.min.y),
-            Align2::LEFT_TOP,
-            label,
+    if let (Some(label), Some(value_galley)) = (label, value_galley) {
+        // One line, hard. `layout` with a wrap width *wraps*, and only one
+        // row of height was ever reserved for it, so a caption too long for
+        // the column spilled its second line down over the bar and out of
+        // the bottom of the card. Truncating with an ellipsis keeps the
+        // caption inside the box it was measured for.
+        let caption_room = (rect.width() - value_galley.size().x - 10.0).max(24.0);
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            label.to_owned(),
             theme::readout(),
             theme::muted(ui),
         );
+        job.wrap.max_width = caption_room;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some(char::from_u32(0x2026).unwrap_or('.'));
+        let caption = painter.layout_job(job);
+        painter.galley(rect.min, caption, theme::muted(ui));
+        painter.galley(
+            pos2(rect.max.x - value_galley.size().x, rect.min.y),
+            value_galley,
+            color,
+        );
+    }
+
+    let bar = Rect::from_min_size(
+        pos2(rect.min.x, rect.max.y - bar_height),
+        vec2(rect.width(), bar_height),
+    );
+    let radius = CornerRadius::same((bar_height * 0.5) as u8);
+    // The unfilled part is context, not content: held well back so the bar
+    // reads as one coloured shape rather than as two competing ones.
+    painter.rect_filled(bar, radius, theme::track(ui).gamma_multiply(0.45));
+
+    if fraction > 0.0 {
+        // A fill narrower than the bar is tall cannot be drawn as a rounded
+        // shape -- the two end caps overlap and it renders as a dark smudge
+        // or nothing at all. Below that point the reading becomes a dot at
+        // the start of the scale: honest about being near zero, and visible.
+        let filled = Rect::from_min_size(
+            bar.min,
+            vec2((bar.width() * fraction).max(bar_height), bar_height),
+        );
+        painter.rect_filled(filled, radius, color);
+    }
+
+    response
+}
+
+/// A stacked bar: several parts of one whole on a single pill track.
+///
+/// Where a `meter` answers "how full", this answers "of what". The segments
+/// butt against each other with no gap, so the bar still reads as one length
+/// first and a breakdown second.
+pub fn stack(ui: &mut Ui, parts: &[(f32, Color32)], height: f32) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let radius = CornerRadius::same((height * 0.5) as u8);
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, theme::track(ui).gamma_multiply(0.45));
+
+    let total: f32 = parts.iter().map(|(value, _)| value.max(0.0)).sum();
+    if total <= 0.0 {
+        return response;
+    }
+    // Each segment is painted as a full-length pill clipped to its own right
+    // edge, back to front. That way the leftmost keeps the round start cap,
+    // the last one painted keeps the round end cap, and the joins between
+    // them stay square -- which is what makes it read as one bar.
+    let mut cursor = 0.0;
+    let mut spans: Vec<(f32, Color32)> = Vec::with_capacity(parts.len());
+    for (value, color) in parts {
+        let value = value.max(0.0);
+        cursor += value / total;
+        // A part that is actually zero contributes nothing and must not be
+        // drawn: its clip would still be widened to the minimum below, and
+        // an empty category would show up as a stub of its own colour.
+        if value > 0.0 {
+            spans.push((cursor, *color));
+        }
+    }
+    for (end, color) in spans.into_iter().rev() {
+        // Never narrower than the bar is tall, or the clipped pill's two end
+        // caps overlap and the segment renders as a smudge.
+        let width = (rect.width() * end).max(height);
+        let clip = Rect::from_min_size(rect.min, vec2(width, rect.height()));
+        painter
+            .with_clip_rect(clip)
+            .rect_filled(rect, radius, color);
     }
     response
 }
@@ -665,7 +789,11 @@ pub fn button(
                 base
             },
             Stroke::new(1.0, theme::line(ui)),
-            if enabled { theme::text(ui) } else { theme::faint(ui) },
+            if enabled {
+                theme::text(ui)
+            } else {
+                theme::faint(ui)
+            },
         ),
         _ => {
             let shade = if down {
@@ -688,7 +816,13 @@ pub fn button(
     };
 
     let painter = ui.painter();
-    painter.rect(rect, CornerRadius::same(5), fill, stroke, StrokeKind::Inside);
+    painter.rect(
+        rect,
+        CornerRadius::same(5),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
 
     let mut x = rect.min.x + 13.0;
     if let Some(glyph) = glyph {
@@ -708,6 +842,7 @@ pub fn button(
         font,
         text_color,
     );
+    response.pointer();
     response
 }
 
@@ -721,6 +856,96 @@ fn contrast_on(background: Color32) -> Color32 {
     } else {
         Color32::WHITE
     }
+}
+
+/// A square icon-only control: one glyph, a hover fill, no label.
+///
+/// For a control whose glyph already says what it does and which sits
+/// somewhere there is no room to say it twice -- the status bar, a card's
+/// top-right corner. A labelled switch was tried in the status bar first and
+/// gave a once-a-month setting the footprint of a primary control.
+///
+/// `on` lights the glyph in the accent, so a toggle shows its state without
+/// a second element beside it.
+pub fn icon_button(ui: &mut Ui, glyph: &str, on: bool, accent: Color32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        let painter = ui.painter();
+        if hovered {
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(6),
+                ui.visuals().widgets.hovered.bg_fill,
+            );
+        }
+        let color = if on {
+            accent
+        } else if hovered {
+            theme::text(ui)
+        } else {
+            theme::muted(ui)
+        };
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            glyph,
+            icon_font(13.0),
+            color,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// A card that is itself the button.
+///
+/// A tile with a small "Open" button in the corner is the worst of both: the
+/// card looks clickable, is not, and the one part that is amounts to a tenth
+/// of its area. This makes the whole surface the target and says so by
+/// lifting on hover.
+///
+/// The hover fill is read from the previous frame, because the frame has to
+/// be painted before the content can be laid inside it and the pointer test
+/// needs a rectangle that does not exist yet. One frame of lag on a colour
+/// change is not perceptible; reserving a shape and backfilling it would be.
+pub fn card_button<R>(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    content: impl FnOnce(&mut Ui) -> R,
+) -> (Response, R) {
+    let id = ui.id().with(id_source);
+    let hovered = ui
+        .ctx()
+        .read_response(id)
+        .is_some_and(|response| response.hovered());
+
+    let visuals = ui.visuals();
+    let frame = egui::Frame::new()
+        .fill(if hovered {
+            visuals.widgets.hovered.bg_fill
+        } else {
+            visuals.widgets.inactive.bg_fill
+        })
+        .stroke(Stroke::new(
+            1.0,
+            if hovered {
+                visuals.widgets.hovered.bg_stroke.color
+            } else {
+                Color32::TRANSPARENT
+            },
+        ))
+        .corner_radius(theme::WIDGET_RADIUS)
+        .inner_margin(egui::Margin::same(16));
+
+    let inner = frame.show(ui, |ui| content(ui));
+    let response = ui.interact(inner.response.rect, id, Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    (response, inner.inner)
 }
 
 /// A badge for a one-word state. Carries its own colour, so a status reads
@@ -786,53 +1011,61 @@ pub fn sensor_chip(
         // Stack explicitly. A grid cell hands down a left-to-right layout, so
         // without this the bar is laid beside the value instead of under it.
         ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(label).small().color(theme::muted(ui)));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(value).small().strong().color(color));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).small().color(theme::muted(ui)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(value).small().strong().color(color));
+                });
             });
-        });
-        match fraction {
-            Some(fraction) => {
-                // Explicit width rather than the inherited one: in a grid cell
-                // the available width collapses, which left the bar invisible.
-                let (rect, _) = ui.allocate_exact_size(vec2(CHIP_WIDTH, 6.0), Sense::hover());
-                if ui.is_rect_visible(rect) {
-                    let radius = CornerRadius::same(3);
-                    let painter = ui.painter();
-                    painter.rect_filled(rect, radius, ui.visuals().extreme_bg_color);
-                    if fraction > 0.0 {
-                        let filled = Rect::from_min_size(
-                            rect.min,
-                            vec2(rect.width() * fraction.clamp(0.0, 1.0), rect.height()),
-                        );
-                        painter.rect_filled(filled, radius, color);
+            match fraction {
+                Some(fraction) => {
+                    // Explicit width rather than the inherited one: in a grid cell
+                    // the available width collapses, which left the bar invisible.
+                    let (rect, _) = ui.allocate_exact_size(vec2(CHIP_WIDTH, 6.0), Sense::hover());
+                    if ui.is_rect_visible(rect) {
+                        let radius = CornerRadius::same(3);
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, radius, theme::track(ui));
+                        if fraction > 0.0 {
+                            // At least as wide as it is tall, so a small
+                            // reading is a visible dot rather than a smear
+                            // the corner radius has eaten.
+                            let filled = Rect::from_min_size(
+                                rect.min,
+                                vec2(
+                                    (rect.width() * fraction.clamp(0.0, 1.0)).max(rect.height()),
+                                    rect.height(),
+                                ),
+                            );
+                            painter.rect_filled(filled, radius, color);
+                        }
                     }
                 }
+                // No scale to draw, but still take the space, so chips with and
+                // without a bar keep a common baseline.
+                None => {
+                    ui.add_space(6.0);
+                }
             }
-            // No scale to draw, but still take the space, so chips with and
-            // without a bar keep a common baseline.
-            None => {
-                ui.add_space(6.0);
-            }
-        }
-        ui.add_space(4.0);
+            ui.add_space(4.0);
         });
     })
     .response
 }
-
 
 /// A sparkline: the shape of a reading over its recent history, drawn small
 /// enough to sit under the figure it belongs to.
 ///
 /// It carries no axes on purpose. The question it answers is "steady, climbing
 /// or spiking", and axes would cost more room than that answer is worth.
+///
+/// The trace is backed by a wash that fades out towards the floor. On a dark
+/// card a bare hairline is almost nothing; the fill gives the shape mass
+/// without drawing a second edge the eye has to read.
 pub fn sparkline(ui: &mut Ui, values: &[f32], color: Color32, ceiling: f32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(
-        vec2(ui.available_width(), 26.0),
-        Sense::hover(),
-    );
+    let height = ui.available_height().clamp(30.0, 46.0);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     if !ui.is_rect_visible(rect) || values.len() < 2 {
         return response;
     }
@@ -846,7 +1079,9 @@ pub fn sparkline(ui: &mut Ui, values: &[f32], color: Color32, ceiling: f32) -> R
             let t = (value / ceiling).clamp(0.0, 1.0);
             pos2(
                 rect.min.x + step * index as f32,
-                rect.max.y - t * rect.height(),
+                // Held a hair off the ceiling so a pegged reading still draws
+                // a line instead of merging with the top edge.
+                rect.max.y - t * (rect.height() - 2.0),
             )
         })
         .collect();
@@ -859,8 +1094,279 @@ pub fn sparkline(ui: &mut Ui, values: &[f32], color: Color32, ceiling: f32) -> R
         rect.max.y,
         Stroke::new(1.0, theme::line(ui)),
     );
-    painter.add(Shape::line(points, Stroke::new(1.3, color)));
+    area_fill(painter, &points, rect.max.y, color);
+    // The newest sample, marked. Without it the trace just stops and which
+    // end is "now" is a guess.
+    let last = *points.last().expect("checked len >= 2 above");
+    painter.add(Shape::line(points, Stroke::new(1.6, color)));
+    painter.circle_filled(last, 2.6, color);
     response
+}
+
+/// The gradient wash under a trace: the series colour at the line, clear at
+/// the floor. Built as a mesh because egui has no gradient brush -- one quad
+/// per sample, with the fade carried on the vertex colours.
+fn area_fill(painter: &egui::Painter, points: &[Pos2], floor: f32, color: Color32) {
+    if points.len() < 2 {
+        return;
+    }
+    let top = color.gamma_multiply(0.28);
+    let bottom = color.gamma_multiply(0.0);
+    let mut mesh = egui::Mesh::default();
+    for point in points {
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(*point, top);
+        mesh.colored_vertex(pos2(point.x, floor), bottom);
+        if base >= 2 {
+            mesh.add_triangle(base - 2, base - 1, base);
+            mesh.add_triangle(base - 1, base, base + 1);
+        }
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// A ring gauge: one fraction, with the figure it stands for in the hole.
+///
+/// For a percentage that is the whole story -- a health score, a drive that
+/// is 73% full. A bar says the same thing in less room, but it says it as a
+/// footnote; the ring makes the number the object on the card.
+pub fn ring(
+    ui: &mut Ui,
+    diameter: f32,
+    fraction: f32,
+    color: Color32,
+    center: &str,
+    sub: &str,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let fraction = fraction.clamp(0.0, 1.0);
+    let thickness = (diameter * 0.11).clamp(6.0, 12.0);
+    let radius = (diameter - thickness) * 0.5;
+    let origin = rect.center();
+    let painter = ui.painter();
+
+    // egui paints no arcs, so the ring is a polyline with enough segments
+    // that the curve reads as a curve rather than as a polygon.
+    let arc = |from: f32, sweep: f32, color: Color32| {
+        let steps = (sweep.abs() / 0.08).ceil().max(2.0) as usize;
+        let points: Vec<Pos2> = (0..=steps)
+            .map(|i| {
+                let angle = from + sweep * (i as f32 / steps as f32);
+                pos2(
+                    origin.x + radius * angle.cos(),
+                    origin.y + radius * angle.sin(),
+                )
+            })
+            .collect();
+        painter.add(Shape::line(points, Stroke::new(thickness, color)));
+    };
+
+    // Twelve o'clock, clockwise: the way a dial is read.
+    let start = -std::f32::consts::FRAC_PI_2;
+    arc(start, std::f32::consts::TAU, theme::track(ui));
+    if fraction > 0.001 {
+        arc(start, std::f32::consts::TAU * fraction, color);
+    }
+
+    let has_sub = !sub.is_empty();
+    painter.text(
+        pos2(origin.x, if has_sub { origin.y - 7.0 } else { origin.y }),
+        Align2::CENTER_CENTER,
+        center,
+        FontId::new((diameter * 0.26).clamp(14.0, 28.0), FontFamily::Monospace),
+        color,
+    );
+    if has_sub {
+        painter.text(
+            pos2(origin.x, origin.y + 12.0),
+            Align2::CENTER_CENTER,
+            sub,
+            FontId::proportional(10.5),
+            theme::muted(ui),
+        );
+    }
+    response
+}
+
+/// The key to a chart: a dot in the series colour and its name, laid along
+/// one line under the plot. Replaces the plot library's boxed legend, which
+/// floats over the data and carries a frame the card does not need.
+pub fn legend(ui: &mut Ui, entries: &[(&str, Color32)]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        for (label, color) in entries {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.5, *color);
+                ui.label(RichText::new(*label).small().color(theme::muted(ui)));
+            });
+        }
+    });
+}
+
+/// One choice in a segmented control -- the range switches above a chart.
+///
+/// `selectable_label` was doing this job and looked like a list selection: a
+/// full-width highlight on a row. These read as what they are, a small set of
+/// mutually exclusive options sitting on the card's header line.
+pub fn segment(ui: &mut Ui, label: &str, selected: bool, accent: Color32) -> Response {
+    let font = FontId::proportional(11.5);
+    let width = ui
+        .fonts_mut(|f| f.layout_no_wrap(label.to_string(), font.clone(), Color32::WHITE))
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(vec2(width + 18.0, 22.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        let fill = if selected {
+            accent.gamma_multiply(0.20)
+        } else if hovered {
+            theme::track(ui).gamma_multiply(0.6)
+        } else {
+            Color32::TRANSPARENT
+        };
+        let text_color = if selected {
+            accent
+        } else if hovered {
+            theme::text(ui)
+        } else {
+            theme::muted(ui)
+        };
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            CornerRadius::same(11),
+            fill,
+            if selected {
+                Stroke::new(1.0, accent.gamma_multiply(0.5))
+            } else {
+                Stroke::NONE
+            },
+            StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            font,
+            text_color,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// A disclosure panel whose header behaves like one of this app's controls.
+///
+/// egui's `CollapsingHeader` was used at every one of these sites before. It
+/// paints a bare triangle beside a default-styled label, which reads as a
+/// debug affordance next to the hand-painted cards sharing the page, and its
+/// hit area is only as wide as the text, so there is no obvious thing to aim
+/// at. The row below spans the panel and fills on hover for that reason.
+///
+/// The title is laid out against the width actually left over and truncated
+/// there. Every text-overflow bug this app has had came from handing a long
+/// string straight to `painter.text`, which clips to nothing and happily
+/// draws past its container, so headers never take that path.
+///
+/// The chevron swaps glyph rather than rotating: `painter.text` cannot rotate
+/// a glyph, and the two Fluent chevrons are already the pair used elsewhere
+/// for expansion, so a swap keeps this consistent with the rest of the chrome.
+pub fn accordion<R>(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    title: &str,
+    default_open: bool,
+    content: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    let id = ui.make_persistent_id(id_source);
+    // The open flag lives in egui's persisted store rather than in a field on
+    // the caller. Most of these panels are built inside loops over findings or
+    // connections, where there is no per-item struct to hang a bool off, and
+    // the state still has to survive the next repaint.
+    let was_open = ui
+        .ctx()
+        .data_mut(|data| *data.get_persisted_mut_or(id, default_open));
+
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let open = if response.clicked() {
+        ui.ctx()
+            .data_mut(|data| data.insert_persisted(id, !was_open));
+        !was_open
+    } else {
+        was_open
+    };
+
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        let title_color = theme::text(ui);
+        let mark_color = if hovered {
+            theme::text(ui)
+        } else {
+            theme::muted(ui)
+        };
+
+        // Laid out before the painter is borrowed, and capped at the space
+        // between the chevron and the right edge rather than at the full row.
+        let text_left = rect.left() + 26.0;
+        let text_width = (rect.right() - 10.0 - text_left).max(24.0);
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            title.to_owned(),
+            theme::card_title(),
+            title_color,
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+
+        let painter = ui.painter();
+        if hovered {
+            painter.rect_filled(
+                rect,
+                theme::WIDGET_RADIUS,
+                ui.visuals().widgets.hovered.bg_fill,
+            );
+        }
+        painter.text(
+            pos2(rect.left() + 13.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            if open {
+                icon::CHEVRON_DOWN
+            } else {
+                icon::CHEVRON_RIGHT
+            },
+            icon_font(11.0),
+            mark_color,
+        );
+        let baseline = rect.center().y - galley.size().y * 0.5;
+        painter.galley(pos2(text_left, baseline), galley, title_color);
+    }
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if !open {
+        return None;
+    }
+
+    // A hairline instead of a gap: with several of these stacked, whitespace
+    // alone left it ambiguous which body belonged to which header.
+    let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(
+        rule.x_range(),
+        rule.center().y,
+        Stroke::new(1.0, theme::line(ui)),
+    );
+    ui.add_space(theme::GAP_TIGHT);
+    let inner = ui.indent(id.with("body"), content).inner;
+    ui.add_space(theme::GAP_TIGHT);
+    Some(inner)
 }
 
 /// The wordmark, decoded for the theme it will be drawn on.

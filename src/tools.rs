@@ -26,6 +26,14 @@ pub struct Action {
     pub name: String,
     pub what: String,
     pub needs_admin: bool,
+    /// Whether this action changes the machine in a way that is awkward or
+    /// slow to undo, and so has to be confirmed before it runs.
+    ///
+    /// Needing administrator rights is not the same question. Plenty of
+    /// read-only consoles need elevation, and resetting the network stack
+    /// needs it too but can also drop a remote or VPN session with no way
+    /// back -- that is what this flag is for.
+    pub destructive: bool,
     pub run: Run,
 }
 
@@ -51,7 +59,16 @@ fn action(name: &str, what: &str, needs_admin: bool, run: Run) -> Action {
         name: name.to_string(),
         what: what.to_string(),
         needs_admin,
+        destructive: false,
         run,
+    }
+}
+
+/// An elevated console command that has to be confirmed first.
+fn admin_console_destructive(name: &str, what: &str, cmd: &str) -> Action {
+    Action {
+        destructive: true,
+        ..admin_console(name, what, cmd)
     }
 }
 
@@ -182,12 +199,12 @@ pub fn repairs() -> Vec<Action> {
             "Read-only chkdsk scan. Does not lock the volume or require a reboot.",
             "chkdsk %SystemDrive% /scan",
         ),
-        admin_console(
+        admin_console_destructive(
             "Reset Windows Update components",
             "Stops the update services, renames the cache folders, starts them again.",
             "net stop wuauserv & net stop bits & net stop cryptsvc & ren %SystemRoot%\\SoftwareDistribution SoftwareDistribution.old & ren %SystemRoot%\\System32\\catroot2 catroot2.old & net start cryptsvc & net start bits & net start wuauserv & echo Done. Reboot when convenient.",
         ),
-        admin_console(
+        admin_console_destructive(
             "Reset the network stack",
             "Winsock catalog, TCP/IP, DNS cache and adapter leases. Reboot afterwards.",
             "ipconfig /flushdns & ipconfig /registerdns & netsh winsock reset & netsh int ip reset & echo Done. Reboot to finish.",
@@ -198,7 +215,7 @@ pub fn repairs() -> Vec<Action> {
             false,
             Run::Console("ipconfig /flushdns".into()),
         ),
-        admin_console(
+        admin_console_destructive(
             "Rebuild the icon cache",
             "Clears the icon databases and restarts Explorer.",
             "taskkill /f /im explorer.exe & del /a /q \"%LOCALAPPDATA%\\IconCache.db\" & del /a /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\iconcache*\" & start explorer.exe",
@@ -385,9 +402,14 @@ pub fn export_registry(dest: &std::path::Path) -> Result<Vec<PathBuf>, String> {
     let mut failures = Vec::new();
     for (short, full) in hives {
         let file = folder.join(format!("{short}.reg"));
-        let status = std::process::Command::new("reg")
-            .args(["export", full, &file.to_string_lossy(), "/y"])
-            .status();
+        let mut command = std::process::Command::new("reg");
+        command.args(["export", full, &file.to_string_lossy(), "/y"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let status = command.status();
         match status {
             Ok(s) if s.success() => written.push(file),
             _ => failures.push(short),
