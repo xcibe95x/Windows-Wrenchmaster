@@ -1,0 +1,42 @@
+# Visual Studio and local user state
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.userprefs
+*.sln.docstates
+
+# Build output and compiler intermediates
+**/bin/
+**/obj/
+artifacts/
+publish/
+packages/
+TestResults/
+*.pdb
+*.mdb
+*.ilk
+*.resources
+*.cache
+*.sdf
+*.opensdf
+
+# Local logs, temporary files, and editor backups
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+
+# Signing keys and local secrets
+*.pfx
+*.snk
+*.key
+*.pem
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+desktop.ini
