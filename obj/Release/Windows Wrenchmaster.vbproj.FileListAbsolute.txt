@@ -1,0 +1,12 @@
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\bin\Verify\Wrenchmaster.exe
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\bin\Verify\Wrenchmaster.pdb
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Windows Wrenchmaster.vbproj.AssemblyReference.cache
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Windows_Wrenchmaster.Resources.resources
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Windows_Wrenchmaster.RegEditBackup.resources
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Windows_Wrenchmaster.WrenchMaster.resources
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Windows Wrenchmaster.vbproj.GenerateResource.cache
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Windows Wrenchmaster.vbproj.CoreCompileInputs.cache
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Wrenchmaster.exe
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\obj\Release\Wrenchmaster.pdb
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\bin\Release\Wrenchmaster.exe
+C:\Users\xcibe\Desktop\Wrenchmaster Legacy\Windows Wrenchmaster\bin\Release\Wrenchmaster.pdb
