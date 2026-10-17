@@ -9,6 +9,149 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
+/// Held for the life of the process once this instance has claimed the name.
+///
+/// The handle has to outlive the call or Windows frees the mutex and the next
+/// launch believes it is the first. A `OnceLock` holding the raw value is the
+/// smallest thing that does that; it is never read back, only kept.
+#[cfg(windows)]
+static INSTANCE_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Claim the one-instance-per-session name. `false` means somebody else has it.
+///
+/// Two copies of this app in one session is not a feature. They poll the same
+/// counters twice, they write `settings.ini` over each other's changes --
+/// whichever closes last wins, silently -- and a cleaner or backup running in
+/// each is two processes walking the same folders. The second launch should
+/// put the window that already exists in front of the user instead, which is
+/// what every well-behaved Windows tool does.
+///
+/// A kernel mutex rather than a lock file: it disappears when the process
+/// does, however it dies, so there is no stale lock to recover from after a
+/// crash.
+///
+/// `ERROR_ACCESS_DENIED` counts as "taken". The running copy will usually be
+/// elevated, and an unelevated process cannot open a high-integrity object for
+/// full access -- being refused the handle is itself proof that the name is
+/// held.
+pub fn claim_single_instance() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::w;
+
+        // Local, not Global: two different users signed in at once are two
+        // machines as far as this app is concerned, and each may have one.
+        let handle = unsafe { CreateMutexW(None, true, w!("Local\\WindowsWrenchmasterInstance")) };
+        let last_error = unsafe { GetLastError() };
+        match handle {
+            Ok(handle) => {
+                if last_error == ERROR_ALREADY_EXISTS {
+                    return false;
+                }
+                let _ = INSTANCE_MUTEX.set(handle.0 as usize);
+                true
+            }
+            Err(_) => last_error != ERROR_ACCESS_DENIED,
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Bring an already-running window to the front, reporting whether it found
+/// one, so the second launch looks like it opened the app rather than like it
+/// did nothing at all.
+///
+/// Searched by window title, which is the one way to ask the question *before*
+/// the elevation handoff: the running copy is normally elevated, and a second
+/// launch must not raise a UAC prompt only to discover a window was open all
+/// along and close again.
+///
+/// Raising is best effort. An unelevated process is not always allowed to put
+/// an elevated window in front, and that failure is not worth a message -- the
+/// window is there either way, and a dialog explaining why a click did nothing
+/// is worse than the click doing nothing.
+pub fn focus_existing_window() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+        };
+        use windows::core::w;
+
+        if let Ok(window) = FindWindowW(None, w!("Windows Wrenchmaster")) {
+            if !window.is_invalid() {
+                let _ = ShowWindow(window, SW_RESTORE);
+                let _ = SetForegroundWindow(window);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// A count with its noun, pluralised properly.
+///
+/// `"1 device(s)"` appeared on nearly every check summary this app prints.
+/// The parenthesised plural is the sort of thing that is invisible while
+/// writing the format string and impossible to unsee in the finished window,
+/// and there were twenty-nine of them.
+///
+/// Regular nouns only: everything this app counts takes a plain `s` (devices,
+/// drives, programs, events, drivers, records). A word that does not belong
+/// here should be written out at the call site rather than taught to this
+/// function.
+pub fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// A span of time in the largest unit that still reads as a whole number:
+/// minutes, then hours, then days. "0.2 days" is a figure nobody thinks in.
+pub fn human_duration(hours: f64) -> String {
+    let minutes = (hours * 60.0).round().max(0.0) as u64;
+    if minutes < 60 {
+        return plural(minutes as usize, "minute");
+    }
+    if minutes < 48 * 60 {
+        let whole = minutes / 60;
+        let rest = minutes % 60;
+        return if rest == 0 {
+            plural(whole as usize, "hour")
+        } else {
+            format!(
+                "{} {}",
+                plural(whole as usize, "hour"),
+                plural(rest as usize, "minute")
+            )
+        };
+    }
+    let days = minutes / (24 * 60);
+    let rest = (minutes % (24 * 60)) / 60;
+    if rest == 0 {
+        plural(days as usize, "day")
+    } else {
+        format!(
+            "{} {}",
+            plural(days as usize, "day"),
+            plural(rest as usize, "hour")
+        )
+    }
+}
+
 /// Human readable byte count. The original tool only ever spoke in GB/MB/KB
 /// of "RAM", this one is used for disks, caches and junk piles alike.
 pub fn human_bytes(bytes: u64) -> String {

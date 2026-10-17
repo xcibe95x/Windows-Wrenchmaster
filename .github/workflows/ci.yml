@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # Windows-only app: it reads the registry, shells out to PowerShell and
+    # links against the Win32 crates. There is nothing to gain from a Linux
+    # runner here.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      # Reported, not enforced. The tree carries a known set of noisy lints
+      # (collapsible_if, too_many_arguments, type_complexity); failing the
+      # build on those would mean either silencing them one by one or living
+      # with a red CI, and neither says anything useful about a change.
+      - name: Clippy
+        run: cargo clippy --locked
+        continue-on-error: true

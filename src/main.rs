@@ -59,10 +59,32 @@ fn startup_log(message: &str) {
 }
 
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    // Two gates, in this order, and the order is the whole subtlety. Neither
+    // applies in development: the dev launcher rebuilds and restarts the app
+    // on every save, so a second copy starting while the first is still
+    // closing is the normal case there, not a mistake to correct. Enforcing
+    // one instance against that loop means the rebuilt app raises the window
+    // of the build it was meant to replace and exits -- which looks exactly
+    // like hot reload having stopped working.
+    if !util::is_development_mode() && util::focus_existing_window() {
+        startup_log("a window is already open; raised it and exited");
+        return Ok(());
+    }
     startup_log("requesting/checking administrator access");
     let elevated = util::request_elevation_at_startup()?;
     startup_log(&format!("elevation check returned {elevated}"));
     if !elevated {
+        return Ok(());
+    }
+    // Then the mutex, and only now -- after the handoff, in the process that
+    // will actually own a window. Claiming it before the handoff made the
+    // launcher hold the name and the elevated copy it had just spawned find
+    // the name taken and exit, so the app closed instead of starting. The
+    // mutex is still worth having for the moment the window has not been
+    // created yet, which the title search cannot see.
+    if !util::is_development_mode() && !util::claim_single_instance() {
+        startup_log("another instance already holds the single-instance name");
+        util::focus_existing_window();
         return Ok(());
     }
     let options = eframe::NativeOptions {

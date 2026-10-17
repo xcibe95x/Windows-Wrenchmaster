@@ -172,6 +172,33 @@ pub fn install_fonts(ctx: &egui::Context) {
             .insert(0, "wrench_mono".to_owned());
     }
 
+    // A real semibold face. egui's `.strong()` only changes colour unless a
+    // heavier font is registered, so until now nothing in this app could
+    // actually be set bold -- which is fine for prose and not fine for a
+    // numeral inside a 24px circle, where weight is the only thing that makes
+    // it read at all.
+    //
+    // The family is always created, with Inter behind whatever bold face the
+    // machine has: asking egui to lay text out in a family that does not
+    // exist is a panic, and this one is named at call sites that cannot check.
+    const STRONG_FILES: [&str; 3] = [
+        r"C:\Windows\Fonts\seguisb.ttf",
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+    ];
+    let mut strong = Vec::new();
+    if let Some(bytes) = first_readable(&STRONG_FILES) {
+        fonts.font_data.insert(
+            "wrench_strong".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        strong.push("wrench_strong".to_owned());
+    }
+    strong.push("inter".to_owned());
+    fonts
+        .families
+        .insert(FontFamily::Name("WrenchStrong".into()), strong);
+
     // Inter is always present, so the set is always worth installing.
     ctx.set_fonts(fonts);
 }
@@ -183,6 +210,13 @@ fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
 
 pub fn icon_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("WrenchIcons".into()))
+}
+
+/// The semibold face, for the few places where weight is doing a job that
+/// colour and size cannot: a figure inside a circle, a value that has to hold
+/// its own against a saturated fill.
+pub fn strong_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("WrenchStrong".into()))
 }
 
 pub fn icon_text(glyph: &str, size: f32, color: Color32) -> RichText {
@@ -1305,12 +1339,18 @@ pub fn accordion<R>(
 
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
-        let title_color = theme::text(ui);
-        let mark_color = if hovered {
+        // Muted and small, not body-coloured. Drawn in the text colour at
+        // card-title size, a closed "Details" row was indistinguishable from
+        // the sentence above it -- a line of plain white text that happened
+        // to be clickable. The chevron carries the accent so the row reads as
+        // a control at a glance, and the title brightens to full text colour
+        // on hover, which is the usual way a quiet control says it is live.
+        let title_color = if hovered {
             theme::text(ui)
         } else {
             theme::muted(ui)
         };
+        let mark_color = theme::accent_on(ui, theme::ACCENT);
 
         // Laid out before the painter is borrowed, and capped at the space
         // between the chevron and the right edge rather than at the full row.
@@ -1318,20 +1358,24 @@ pub fn accordion<R>(
         let text_width = (rect.right() - 10.0 - text_left).max(24.0);
         let mut job = egui::text::LayoutJob::simple_singleline(
             title.to_owned(),
-            theme::card_title(),
+            theme::disclosure(),
             title_color,
         );
         job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
 
         let painter = ui.painter();
-        if hovered {
-            painter.rect_filled(
-                rect,
-                theme::WIDGET_RADIUS,
-                ui.visuals().widgets.hovered.bg_fill,
-            );
-        }
+        // A standing surface rather than one that appears on hover: the row
+        // has to look like something before the pointer is anywhere near it.
+        painter.rect_filled(
+            rect,
+            theme::WIDGET_RADIUS,
+            if hovered {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                theme::track(ui).gamma_multiply(0.25)
+            },
+        );
         painter.text(
             pos2(rect.left() + 13.0, rect.center().y),
             Align2::CENTER_CENTER,
@@ -1367,6 +1411,359 @@ pub fn accordion<R>(
     let inner = ui.indent(id.with("body"), content).inner;
     ui.add_space(theme::GAP_TIGHT);
     Some(inner)
+}
+
+/// One step of a `steps` track: its colour, whether it has happened yet, and
+/// what to say about it on hover.
+pub struct Step {
+    pub color: Color32,
+    pub done: bool,
+    pub hover: String,
+}
+
+/// A horizontal stepper: a dot per step, joined by a line, detail on hover.
+///
+/// For a sequence short enough to count and long enough that a row each would
+/// take the page -- seventeen machine checks as seventeen lines pushed the
+/// findings below the fold, while a plain bar at `done/total` loses which step
+/// is which. The dots keep both, in one row: how far along, and that the thing
+/// advancing is a list of named steps rather than a timer.
+///
+/// The detail goes in a tooltip rather than beside each dot, because seventeen
+/// labels do not fit across any window and nobody needs all of them at once;
+/// they need the one they are pointing at. The tooltip follows the pointer, so
+/// which dot it belongs to is never in doubt.
+///
+/// A finished step is a filled dot and a done segment is a solid line; the
+/// ones ahead are hollow dots on the track colour, so the boundary between
+/// what has run and what has not is readable at a glance and without colour.
+pub fn steps(
+    ui: &mut Ui,
+    marks: &[Step],
+    active: Option<usize>,
+    accent: Color32,
+    height: f32,
+) -> Response {
+    // `Sense::click()` rather than `Sense::hover()`, even though nothing here
+    // is clickable: a hover-sensed rect is not a widget egui will hang a
+    // tooltip on, so the first version painted the dots correctly and showed
+    // nothing when you pointed at them.
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    if marks.is_empty() {
+        return response;
+    }
+    let count = marks.len();
+    // Big enough to hold its own number and to be an easy thing to point at.
+    // The first pass drew six-point dots, which read as a dotted line rather
+    // than as a row of steps and were fiddly to hover.
+    let radius = (height * 0.42).clamp(8.0, 13.0);
+    let span = if count > 1 {
+        (rect.width() - radius * 2.0) / (count - 1) as f32
+    } else {
+        0.0
+    };
+    let centre = |index: usize| pos2(rect.left() + radius + span * index as f32, rect.center().y);
+    // Numbers only while they fit inside the dot with room to spare. Past
+    // twenty-odd steps in a narrow window the dots crowd and a numeral in
+    // each is a smear, so the dots carry the progress alone and the tooltip
+    // carries the name -- which is where the name was always going to be.
+    let numbered = span > radius * 2.4 && radius >= 9.0;
+
+    if ui.is_rect_visible(rect) {
+        let track = theme::track(ui);
+        let painter = ui.painter();
+        // A joining line is coloured when the step it leads *into* has either
+        // finished or started. The line arriving at the running step stands
+        // for the work already behind it, which is real progress and should
+        // look like it; it is only the line *leaving* the frontier -- into a
+        // step nothing has happened to yet -- that stays grey, and that part
+        // is dashed as well as grey, so the boundary between done and not
+        // done survives being printed, screenshotted or looked at by someone
+        // who does not separate those two colours.
+        //
+        // Each segment stops at the dots rather than running between their
+        // centres. Drawn centre to centre it passes under every dot, and a
+        // dot that is not filled -- which is every step still to come -- let
+        // the line through the middle of its own number.
+        for (index, mark) in marks.iter().enumerate().skip(1) {
+            let reached = mark.done || active == Some(index);
+            let from = centre(index - 1) + vec2(radius + 2.0, 0.0);
+            let to = centre(index) - vec2(radius + 2.0, 0.0);
+            if to.x <= from.x {
+                continue;
+            }
+            if reached {
+                painter.line_segment([from, to], Stroke::new(2.0, accent));
+            } else {
+                painter.add(egui::Shape::dashed_line(
+                    &[from, to],
+                    Stroke::new(2.0, track),
+                    4.0,
+                    4.0,
+                ));
+            }
+        }
+        // Inverted: the verdict is the ring and the accent is the fill. A
+        // finished step is an accent disc outlined in its own status colour,
+        // so the row keeps one body colour down its length and the severity
+        // reads as an edge rather than as eighteen competing discs. Red and
+        // amber are far louder than the accent at this size, and as fills they
+        // dragged the eye to whichever check happened to be worst instead of
+        // to the step being pointed at.
+        for (index, mark) in marks.iter().enumerate() {
+            let point = centre(index);
+            let numeral = if mark.done {
+                // A darkened accent, not the accent itself. The Windows
+                // accent is a bright azure and eighteen of them at full
+                // strength is a string of lamps; taken down it sits back on
+                // the card and lets the status ring and the numeral read.
+                painter.circle_filled(point, radius, accent.gamma_multiply(0.55));
+                painter.circle_stroke(point, radius, Stroke::new(2.0, mark.color));
+                // White rather than the card's background. The background was
+                // near-black on a mid-blue disc, which is the lowest-contrast
+                // pair available here; a numeral has to be legible at eleven
+                // points or it is decoration.
+                Color32::WHITE
+            } else if active == Some(index) {
+                // The one in progress is a ring, not a disc: filling it would
+                // say finished, which during the step that can take a minute
+                // is exactly the wrong thing to say. It keeps the accent on
+                // the edge, where every unfinished step carries it.
+                painter.circle_filled(point, radius, track);
+                painter.circle_stroke(point, radius, Stroke::new(2.5, accent));
+                theme::text(ui)
+            } else {
+                // Ahead of the frontier the same ring is dimmed rather than
+                // swapped for a grey one: still obviously the same track,
+                // still obviously not done yet. Filled with the card's own
+                // colour first, so the dot is opaque and nothing drawn behind
+                // it reads as part of the number inside it.
+                painter.circle_filled(
+                    point,
+                    radius - 1.0,
+                    ui.visuals().widgets.noninteractive.bg_fill,
+                );
+                painter.circle_stroke(
+                    point,
+                    radius - 1.0,
+                    Stroke::new(1.5, accent.gamma_multiply(0.3)),
+                );
+                theme::faint(ui)
+            };
+            if numbered {
+                // Laid out and centred on the galley rather than handed to
+                // painter.text with CENTER_CENTER: that centres on the font's
+                // full line box, ascenders and descenders included, so a digit
+                // -- which has neither -- sits visibly low in the circle.
+                // Centring the drawn glyph's own box puts it where the eye
+                // expects it.
+                let label = (index + 1).to_string();
+                let font = strong_font((radius * 0.95).min(12.0));
+                let galley = painter.layout_no_wrap(label, font, numeral);
+                painter.galley(point - galley.size() * 0.5, galley, numeral);
+            }
+        }
+    }
+
+    // The nearest dot to the pointer, not strictly the one under it: pointing
+    // between two dots should still answer, rather than blanking the tooltip
+    // every time the mouse crosses a gap.
+    //
+    // `contains_pointer` rather than `hover_pos`, because the pointer being
+    // over the row is the whole question here -- `hovered` additionally wants
+    // the widget to be the one taking input, which a decorative strip inside a
+    // card is not always judged to be.
+    if response.contains_pointer() {
+        let pointer = ui
+            .ctx()
+            .pointer_latest_pos()
+            .unwrap_or_else(|| rect.center());
+        let index = if span > 0.0 {
+            (((pointer.x - rect.left() - radius) / span).round().max(0.0) as usize).min(count - 1)
+        } else {
+            0
+        };
+        let hover = marks[index].hover.clone();
+        return response.on_hover_text_at_pointer(hover);
+    }
+    response
+}
+
+/// Which `accordion_panel` is open, for the whole window.
+///
+/// Temporary rather than persisted: a fresh run should open on the section the
+/// page author chose, not on whatever happened to be open a week ago.
+#[derive(Clone, Default)]
+struct PanelGroup {
+    /// Whether anyone has clicked a panel yet. Until they have, a panel that
+    /// asked to start open is allowed to be open; afterwards the user's last
+    /// click is the only thing that decides.
+    touched: bool,
+    open: Option<Id>,
+}
+
+/// A whole section behind one disclosure: icon, title, the verdict on the
+/// right, and a surface under all three.
+///
+/// `accordion` is deliberately bare, because most of its uses sit inside a
+/// card that already has a border -- a "Details" line under a list row wants
+/// no chrome of its own. A section header is the opposite problem: standing
+/// alone on the page with nothing but a chevron beside it, it reads as a line
+/// of stray text rather than as the lid of the thing below it. This one is
+/// built like a card so it looks like something you can open, carries its icon
+/// so it is findable by shape, and keeps its status to the right so the page
+/// still answers the question with every section shut.
+///
+/// Header and body share one bordered surface, so an open panel is visibly one
+/// object. The same persisted-id scheme as `accordion`: state survives the
+/// repaint without the caller holding a bool.
+pub fn accordion_panel<R>(
+    ui: &mut Ui,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    glyph: &str,
+    title: &str,
+    status: &str,
+    // The colour of the status text. `None` keeps it quiet; a severity colour
+    // makes a section announce from its own closed header that there is
+    // something serious inside, which is the only way a folded page can still
+    // say where to look first.
+    status_color: Option<Color32>,
+    accent: Color32,
+    default_open: bool,
+    content: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    let id = ui.make_persistent_id(id_source);
+    // One of these is open at a time, so the group keeps a single id rather
+    // than every panel keeping a bool. Three sections open at once is a page
+    // several screens long with its own headings scrolled off the top, and
+    // closing the last one by hand before opening the next is work the user
+    // should not be doing. Clicking the open one still shuts it: the state
+    // with nothing open has to stay reachable.
+    let group = ui.ctx().data_mut(|data| {
+        let group: &mut PanelGroup = data.get_temp_mut_or_default(Id::new("accordion-panel-group"));
+        if !group.touched && default_open {
+            group.open = Some(id);
+        }
+        group.clone()
+    });
+    let was_open = group.open == Some(id);
+    let mut inner = None;
+
+    theme::card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+        let open = if response.clicked() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    Id::new("accordion-panel-group"),
+                    PanelGroup {
+                        touched: true,
+                        open: (!was_open).then_some(id),
+                    },
+                );
+            });
+            !was_open
+        } else {
+            was_open
+        };
+
+        if ui.is_rect_visible(rect) {
+            let hovered = response.hovered();
+            let text_color = theme::text(ui);
+            let mark_color = if hovered {
+                text_color
+            } else {
+                theme::muted(ui)
+            };
+
+            // The status is measured first and the title gets what is left.
+            // In the other order a long section name eats the row and the
+            // verdict -- the one part worth reading while shut -- falls off
+            // the right edge.
+            let status_text = status_color.unwrap_or_else(|| theme::muted(ui));
+            let status_galley = (!status.is_empty()).then(|| {
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    status.to_owned(),
+                    theme::readout(),
+                    status_text,
+                );
+                job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() * 0.45);
+                ui.fonts_mut(|fonts| fonts.layout_job(job))
+            });
+            let status_width = status_galley
+                .as_ref()
+                .map_or(0.0, |galley| galley.size().x + theme::GAP);
+
+            let text_left = rect.left() + 26.0;
+            let text_width = (rect.right() - 24.0 - status_width - text_left).max(24.0);
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                title.to_owned(),
+                theme::card_title(),
+                text_color,
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(text_width);
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+
+            let painter = ui.painter();
+            painter.text(
+                pos2(rect.left() + 9.0, rect.center().y),
+                Align2::CENTER_CENTER,
+                glyph,
+                icon_font(15.0),
+                accent,
+            );
+            painter.galley(
+                pos2(text_left, rect.center().y - galley.size().y * 0.5),
+                galley,
+                text_color,
+            );
+            if let Some(status_galley) = status_galley {
+                painter.galley(
+                    pos2(
+                        rect.right() - 22.0 - status_galley.size().x,
+                        rect.center().y - status_galley.size().y * 0.5,
+                    ),
+                    status_galley,
+                    status_text,
+                );
+            }
+            // The chevron sits at the right edge rather than beside the title:
+            // on a row this wide a mark on the left is a long way from the
+            // verdict the eye ends on.
+            painter.text(
+                pos2(rect.right() - 8.0, rect.center().y),
+                Align2::CENTER_CENTER,
+                if open {
+                    icon::CHEVRON_DOWN
+                } else {
+                    icon::CHEVRON_RIGHT
+                },
+                icon_font(11.0),
+                mark_color,
+            );
+        }
+
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        if open {
+            ui.add_space(theme::GAP);
+            let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().hline(
+                rule.x_range(),
+                rule.center().y,
+                Stroke::new(1.0, theme::line(ui)),
+            );
+            ui.add_space(theme::GAP);
+            inner = Some(content(ui));
+        }
+    });
+
+    inner
 }
 
 /// The wordmark, decoded for the theme it will be drawn on.

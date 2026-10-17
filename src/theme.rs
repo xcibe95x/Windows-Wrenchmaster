@@ -19,11 +19,21 @@ use egui::{
 pub const ACCENT: Color32 = Color32::from_rgb(0x4D, 0xA3, 0xFF);
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x2B, 0x5E, 0x9E);
 
-/// Semantic indicator colors, held just off full saturation so green, amber,
-/// and red remain distinct in compact status chips and charts.
-pub const GOOD: Color32 = Color32::from_rgb(0x5F, 0xA9, 0x74);
-pub const WARN: Color32 = Color32::from_rgb(0xD9, 0x9A, 0x2B);
-pub const BAD: Color32 = Color32::from_rgb(0xD2, 0x56, 0x4F);
+/// Semantic indicator colors.
+///
+/// These were held just off full saturation, on the theory that a compact
+/// status chip wants a quiet colour. On the near-black chassis the result was
+/// a dull sage, a mustard and a brick that read as three greys at dot size --
+/// and the stepper is eighteen dots. They now sit in the same high-chroma
+/// family as the chart palette below, which was already bright for exactly
+/// this reason: on a dark card a muted colour disappears.
+///
+/// The hues stay clear of the chart series as well as of each other. `WARN`
+/// is orange rather than yellow so it cannot be taken for the `AMBER` series
+/// line, which is the rule the chart palette already keeps.
+pub const GOOD: Color32 = Color32::from_rgb(0x22, 0xC5, 0x5E);
+pub const WARN: Color32 = Color32::from_rgb(0xFB, 0x92, 0x3C);
+pub const BAD: Color32 = Color32::from_rgb(0xF4, 0x3F, 0x5E);
 
 /// The chart palette. Data series need hues that stay apart from each other
 /// *and* from the semantic three above, so a line is never mistaken for a
@@ -69,9 +79,9 @@ pub const FAINT: Color32 = Color32::from_rgb(0x8C, 0x99, 0xAB);
 /// The dark values sit at roughly 6:1 against the dark panel but only 2.2-3.7:1
 /// against the light one, which is below the 4.5:1 that small text needs. These
 /// are the same hues taken down until they pass on a light ground.
-const L_GOOD: Color32 = Color32::from_rgb(0x24, 0x6B, 0x42);
-const L_WARN: Color32 = Color32::from_rgb(0x8A, 0x56, 0x06);
-const L_BAD: Color32 = Color32::from_rgb(0xA8, 0x27, 0x21);
+const L_GOOD: Color32 = Color32::from_rgb(0x12, 0x7A, 0x3E);
+const L_WARN: Color32 = Color32::from_rgb(0xA5, 0x4A, 0x00);
+const L_BAD: Color32 = Color32::from_rgb(0xC0, 0x1F, 0x3C);
 
 pub fn good(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode { GOOD } else { L_GOOD }
@@ -182,6 +192,17 @@ pub fn eyebrow() -> FontId {
     FontId::new(11.5, FontFamily::Proportional)
 }
 
+/// The label on a disclosure row: the "Details" line that opens a panel.
+///
+/// Smaller than `card_title` and a role of its own, because a disclosure is
+/// not a heading -- it is a control that happens to be made of words, and set
+/// at title size in the text colour it reads as a paragraph that is somehow
+/// clickable. Added as a token rather than a number at the call site: a tenth
+/// near-identical font size is how a type scale stops being a scale.
+pub fn disclosure() -> FontId {
+    FontId::new(12.0, FontFamily::Proportional)
+}
+
 /// A measurement. Monospace for tabular figures; see rule 2 above.
 pub fn readout() -> FontId {
     FontId::new(13.0, FontFamily::Monospace)
@@ -239,6 +260,15 @@ fn shape(style: &mut Style) {
         (TextStyle::Monospace, readout()),
     ]
     .into();
+
+    // Tooltips, which this app leans on harder than most: the stepper puts
+    // each check's whole verdict behind one, so a tooltip that takes half a
+    // second and insists the pointer be perfectly still reads as no tooltip
+    // at all. egui reads these from the *global* style when it decides
+    // whether to show one, so a local override at the call site does nothing
+    // and the policy has to live here with the rest of the tokens.
+    style.interaction.tooltip_delay = 0.1;
+    style.interaction.show_tooltips_only_when_still = false;
 
     style.spacing.item_spacing = egui::vec2(10.0, 7.0);
     style.spacing.button_padding = egui::vec2(14.0, 8.0);

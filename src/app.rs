@@ -31,7 +31,8 @@ use crate::tools::{self, Action};
 use crate::treesize::{self, ScanHandle, ScanMessage, ScanProgress, ScanResult};
 use crate::tweaks::{self, State, Tweak};
 use crate::util::{
-    human_bytes, is_development_mode, is_elevated, relaunch_elevated, run_activation_scripts,
+    human_bytes, is_development_mode, is_elevated, plural, relaunch_elevated,
+    run_activation_scripts,
 };
 use crate::{app_residue, registry_audit, startup};
 
@@ -280,6 +281,11 @@ pub struct App {
     tab: Tab,
     storage_view: StorageView,
     settings_view: SettingsView,
+    // One sidebar group is open at a time, the same rule the page sections
+    // follow. Four open groups push the lower entries off a short window,
+    // which is the bug the nav list grew its own scrollbar to paper over.
+    // `open_group` is set through `expand_group`; the per-group bools are
+    // derived from it so no call site can set two of them.
     storage_expanded: bool,
     hardware_expanded: bool,
     security_expanded: bool,
@@ -330,6 +336,25 @@ pub struct App {
     diagnose_running_check: Option<diagnose::CheckId>,
     diagnose_outcomes: Vec<diagnose::CheckOutcome>,
     diagnose_event_result: Option<EventScanResult>,
+    /// How long each finished check actually took, in the order they finished.
+    /// Timed by the worker around the check itself, so the figure the stepper
+    /// shows is the work, not the delay before the window drained the channel.
+    diagnose_durations: Vec<(diagnose::CheckId, Duration)>,
+    /// The silent startup probe, kept entirely apart from the diagnostic.
+    ///
+    /// Sharing `diagnose_outcomes` meant the Diagnose page filled itself in
+    /// and ran its stepper on launch, which is the pipeline running in front
+    /// of a user who never asked for it. These results only feed the score.
+    probe_rx: Option<Receiver<diagnose::CheckMessage>>,
+    probe_outcomes: Vec<diagnose::CheckOutcome>,
+    probe_durations: Vec<(diagnose::CheckId, Duration)>,
+    /// Whether Diagnose is showing the short answer or the whole report.
+    ///
+    /// Starts on the short answer. Someone who wants the evidence will find
+    /// one switch at the top of the page; someone who wanted to know whether
+    /// their machine is alright should not have to scroll past seventeen
+    /// check rows to find out that it is.
+    diagnose_simple: bool,
     app_residue_rx: Option<Receiver<app_residue::ScanResult>>,
     app_residue_result: Option<app_residue::ScanResult>,
     registry_audit_rx: Option<Receiver<registry_audit::AuditReport>>,
@@ -453,6 +478,11 @@ impl App {
             diagnose_running_check: None,
             diagnose_outcomes: Vec::new(),
             diagnose_event_result: None,
+            diagnose_durations: Vec::new(),
+            probe_rx: None,
+            probe_outcomes: Vec::new(),
+            probe_durations: Vec::new(),
+            diagnose_simple: true,
             app_residue_rx: None,
             app_residue_result: None,
             registry_audit_rx: None,
@@ -487,9 +517,13 @@ impl App {
             ai_source: AiSource::Claude,
             ai_discovered: None,
         };
-        // A passive CPU/RAM sample plus a bounded recent-event query. No
-        // stress workload, cleanup, or system changes run at startup.
-        app.start_diagnosis(false);
+        // A quick, quiet pass so the health score has something real behind
+        // it shortly after the window opens. It is the cheap checks only --
+        // no DISM, no update history, no crash log -- and it says nothing in
+        // the status bar: nobody asked for it, so it should not announce
+        // itself. Until it lands the score reads a neutral 50 rather than
+        // pretending to a verdict. The full sweep runs when the user asks.
+        app.start_quick_diagnosis_if_stale();
         app
     }
 
@@ -849,8 +883,10 @@ impl App {
             match message {
                 diagnose::CheckMessage::Started(id) => self.diagnose_running_check = Some(id),
                 diagnose::CheckMessage::Events(result) => self.diagnose_event_result = Some(result),
-                diagnose::CheckMessage::Finished(outcome) => {
+                diagnose::CheckMessage::Finished(outcome, elapsed) => {
                     self.diagnose_running_check = None;
+                    self.diagnose_durations.retain(|(id, _)| *id != outcome.id);
+                    self.diagnose_durations.push((outcome.id, elapsed));
                     // Re-running the scan without clearing first would stack a
                     // second row per check, so the old verdict is dropped.
                     self.diagnose_outcomes
@@ -895,13 +931,133 @@ impl App {
         self.refresh_ram_data();
         self.diagnose_event_result = None;
         self.diagnose_outcomes.clear();
+        self.diagnose_durations.clear();
         self.diagnose_running_check = None;
-        self.diagnose_scan_rx = Some(diagnose::start_system_scan());
+        self.diagnose_scan_rx = Some(diagnose::start_system_scan(diagnose::Scope::Full));
         if notify {
-            self.say("Running the read-only machine checks…");
+            self.say("Running the read-only diagnostic…");
         }
     }
 
+    /// The startup pass: the cheap checks, no announcement.
+    ///
+    /// Kept separate from `start_diagnosis` rather than hidden behind another
+    /// boolean, because the two have different jobs. This one feeds the score
+    /// on the Overview; that one is a diagnosis the user asked for and whose
+    /// progress they are watching.
+    /// Run the startup pass only when the cached score is old or missing.
+    ///
+    /// Twelve hours. Launching the app is not a request to scan the machine,
+    /// and with the dev loop restarting it on every save it was scanning
+    /// constantly. A score from this morning is a better answer than a fresh
+    /// sweep nobody asked for.
+    fn start_quick_diagnosis_if_stale(&mut self) {
+        // Once a week. The probe exists so a machine nobody has run a
+        // diagnostic on still shows something true; it is not a schedule for
+        // checking up on anyone, and running it per launch was the complaint
+        // that produced it.
+        const MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        let last_look = self
+            .settings
+            .last_probe_at
+            .max(self.settings.last_health_checked);
+        let fresh = last_look.is_some_and(|checked| now.saturating_sub(checked) < MAX_AGE_SECONDS);
+        if fresh && self.settings.last_health_score.is_some() {
+            return;
+        }
+        self.settings.last_probe_at = Some(now);
+        self.settings.save();
+        self.start_quick_diagnosis();
+    }
+
+    fn start_quick_diagnosis(&mut self) {
+        self.refresh_ram_data();
+        self.probe_outcomes.clear();
+        self.probe_durations.clear();
+        self.probe_rx = Some(diagnose::start_system_scan(diagnose::Scope::HealthProbe));
+    }
+
+    /// Drain the probe. Nothing here touches the Diagnose page's state: no
+    /// stepper, no check rows, no running-check spinner. The event result is
+    /// the one exception, because the score counts reliability events and the
+    /// figure is the same either way.
+    fn poll_probe(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.probe_rx.as_ref() else {
+            return;
+        };
+        let mut messages = Vec::new();
+        let mut finished = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        for message in messages {
+            match message {
+                diagnose::CheckMessage::Events(result) => {
+                    if self.diagnose_event_result.is_none() {
+                        self.diagnose_event_result = Some(result);
+                    }
+                }
+                diagnose::CheckMessage::Finished(outcome, elapsed) => {
+                    self.probe_durations.retain(|(id, _)| *id != outcome.id);
+                    self.probe_durations.push((outcome.id, elapsed));
+                    self.probe_outcomes
+                        .retain(|existing| existing.id != outcome.id);
+                    self.probe_outcomes.push(outcome);
+                }
+                diagnose::CheckMessage::AllDone => finished = true,
+                diagnose::CheckMessage::Started(_) => {}
+            }
+        }
+        if finished {
+            self.probe_rx = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(400));
+        }
+    }
+
+    /// How far the score has moved since the previous measurement.
+    fn health_trend(&self) -> Option<i32> {
+        let now = self.settings.last_health_score? as i32;
+        let before = self.settings.prior_health_score? as i32;
+        let delta = now - before;
+        (delta != 0).then_some(delta)
+    }
+
+    /// How long ago the cached score was measured, in hours.
+    fn health_age_hours(&self) -> Option<f64> {
+        let checked = self.settings.last_health_checked?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(now.saturating_sub(checked) as f64 / 3600.0)
+    }
+
+    /// The check results the score should use: the diagnostic when the user
+    /// has run one, the probe otherwise.
+    fn scored_checks(&self) -> &[diagnose::CheckOutcome] {
+        if self.diagnose_outcomes.is_empty() {
+            &self.probe_outcomes
+        } else {
+            &self.diagnose_outcomes
+        }
+    }
+
+    /// Remember the score, and -- only for a diagnostic the user ran -- when
+    /// it was measured. The probe refreshes the figure without claiming the
+    /// machine was checked: "last checked" has to mean the real sweep, or it
+    /// means nothing.
     fn cache_health(&mut self, health: &Health) {
         if health.mood == health::Mood::Checking
             || self.settings.last_health_score == Some(health.score)
@@ -911,7 +1067,14 @@ impl App {
         if self.settings.last_health_score.is_none()
             || self.health_cache_refreshed.elapsed() >= Duration::from_secs(30)
         {
+            self.settings.prior_health_score = self.settings.last_health_score;
             self.settings.last_health_score = Some(health.score);
+            if !self.diagnose_outcomes.is_empty() {
+                self.settings.last_health_checked = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_secs())
+                    .ok();
+            }
             self.settings.save();
             self.health_cache_refreshed = Instant::now();
         }
@@ -976,7 +1139,8 @@ impl App {
                 let count = result.findings.len();
                 self.app_residue_result = Some(result);
                 self.say(format!(
-                    "AppData review finished: {count} possible leftover folder(s)."
+                    "AppData review finished: {} possible leftover.",
+                    plural(count, "folder")
                 ));
             }
             Some(Err(TryRecvError::Empty)) => ctx.request_repaint_after(Duration::from_millis(200)),
@@ -994,7 +1158,8 @@ impl App {
                 let count = result.candidates.len();
                 self.registry_audit_result = Some(result);
                 self.say(format!(
-                    "Registry review finished: {count} possible stale record(s). No changes made."
+                    "Registry review finished: {} possibly stale. No changes made.",
+                    plural(count, "record")
                 ));
             }
             Some(Err(TryRecvError::Empty)) => ctx.request_repaint_after(Duration::from_millis(200)),
@@ -1436,6 +1601,7 @@ impl eframe::App for App {
         self.poll_job(&ctx);
         self.poll_token_scan(&ctx);
         self.poll_diagnose_events(&ctx);
+        self.poll_probe(&ctx);
         self.poll_backup_job(&ctx);
         self.poll_readonly_scans(&ctx);
         self.poll_security_integrity(&ctx);
@@ -1528,7 +1694,7 @@ impl App {
                                         self.hardware_expanded = false;
                                     } else {
                                         self.tab = Tab::Hardware;
-                                        self.hardware_expanded = true;
+                                        self.expand_group(NavGroup::Hardware);
                                     }
                                 }
 
@@ -1561,7 +1727,7 @@ impl App {
                                         .inner;
                                     if clicked {
                                         self.tab = Tab::Memory;
-                                        self.hardware_expanded = true;
+                                        self.expand_group(NavGroup::Hardware);
                                     }
                                 }
                                 continue;
@@ -1585,7 +1751,7 @@ impl App {
                                     } else {
                                         self.tab = Tab::Storage;
                                         self.storage_view = StorageView::Summary;
-                                        self.storage_expanded = true;
+                                        self.expand_group(NavGroup::Storage);
                                     }
                                 }
 
@@ -1621,7 +1787,7 @@ impl App {
                                     if clicked {
                                         self.tab = Tab::Storage;
                                         self.storage_view = StorageView::Cleanup;
-                                        self.storage_expanded = true;
+                                        self.expand_group(NavGroup::Storage);
                                     }
 
                                     let clicked = ui
@@ -1649,7 +1815,7 @@ impl App {
                                     if clicked {
                                         self.tab = Tab::Storage;
                                         self.storage_view = StorageView::SizeExplorer;
-                                        self.storage_expanded = true;
+                                        self.expand_group(NavGroup::Storage);
                                     }
 
                                     let clicked = ui
@@ -1677,7 +1843,7 @@ impl App {
                                     if clicked {
                                         self.tab = Tab::Storage;
                                         self.storage_view = StorageView::AppLeftovers;
-                                        self.storage_expanded = true;
+                                        self.expand_group(NavGroup::Storage);
                                     }
                                 }
                                 continue;
@@ -1705,7 +1871,7 @@ impl App {
                                         self.security_expanded = false;
                                     } else {
                                         self.tab = Tab::Security;
-                                        self.security_expanded = true;
+                                        self.expand_group(NavGroup::Security);
                                     }
                                 }
 
@@ -1738,7 +1904,7 @@ impl App {
                                         .inner;
                                     if clicked {
                                         self.tab = Tab::Privacy;
-                                        self.security_expanded = true;
+                                        self.expand_group(NavGroup::Security);
                                     }
                                 }
                                 continue;
@@ -1760,7 +1926,7 @@ impl App {
                                         self.tools_expanded = false;
                                     } else {
                                         self.tab = Tab::Tools;
-                                        self.tools_expanded = true;
+                                        self.expand_group(NavGroup::Tools);
                                     }
                                 }
 
@@ -1836,7 +2002,7 @@ impl App {
                                     });
                                     if let Some(child) = selected_child {
                                         self.tab = child;
-                                        self.tools_expanded = true;
+                                        self.expand_group(NavGroup::Tools);
                                     }
                                 }
                                 continue;
@@ -1866,6 +2032,18 @@ impl App {
                         }
                     });
             });
+    }
+
+    /// Open one sidebar group and fold the rest away.
+    ///
+    /// Every place that used to write `self.x_expanded = true` goes through
+    /// here instead, because the rule only holds if it is impossible to set
+    /// one without clearing the others.
+    fn expand_group(&mut self, group: NavGroup) {
+        self.hardware_expanded = group == NavGroup::Hardware;
+        self.storage_expanded = group == NavGroup::Storage;
+        self.security_expanded = group == NavGroup::Security;
+        self.tools_expanded = group == NavGroup::Tools;
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -1971,32 +2149,77 @@ impl App {
     }
 
     fn body(&mut self, ui: &mut Ui) {
+        // No right margin on the panel: the scroll area has to reach the
+        // window edge so its bar sits against the edge instead of over the
+        // page. The padding the content needs is applied inside, by `gutter`,
+        // so the bar has nothing underneath it.
         let frame = egui::Frame::new()
             .fill(ui.visuals().panel_fill)
-            .inner_margin(Margin::symmetric(20, 18));
+            .inner_margin(Margin {
+                left: 20,
+                right: 0,
+                top: 18,
+                bottom: 18,
+            });
+        let gutter = egui::Frame::new().inner_margin(Margin {
+            left: 0,
+            right: 20,
+            top: 0,
+            bottom: 0,
+        });
         CentralPanel::default().frame(frame).show(ui, |ui| {
-            ui.label(RichText::new(self.tab.title()).heading());
-            ui.label(RichText::new(self.tab.blurb()).color(MUTED));
+            gutter.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(self.tab.title()).heading());
+                ui.label(RichText::new(self.tab.blurb()).color(MUTED));
+            });
             ui.add_space(theme::GAP_SECTION);
+
+            // The app hides every scrollbar by default, which is right for
+            // the sidebar and the small lists inside cards: they are short and
+            // their edges say where they end. A page is neither -- it can run
+            // four screens with no sign there is more.
+            //
+            // Floating, so it allocates no width and the page does not shift
+            // sideways depending on whether it scrolls. It draws at the right
+            // edge of the scroll area, which now reaches the window edge, so
+            // it sits in the gutter rather than over a widget.
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle {
+                bar_width: 6.0,
+                floating_allocated_width: 0.0,
+                handle_min_length: 24.0,
+                dormant_handle_opacity: 0.55,
+                active_handle_opacity: 0.9,
+                interact_handle_opacity: 1.0,
+                dormant_background_opacity: 0.0,
+                active_background_opacity: 0.0,
+                interact_background_opacity: 0.0,
+                ..egui::style::ScrollStyle::floating()
+            };
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| match self.tab {
-                    Tab::Overview => self.page_overview(ui),
-                    Tab::Diagnose => self.full_benchmark_panel(ui),
-                    Tab::SystemInfo => self.page_system_info(ui),
-                    Tab::Hardware => self.page_hardware(ui),
-                    Tab::Memory => self.page_memory(ui),
-                    Tab::Storage => self.page_storage(ui),
-                    Tab::Tweaks => self.page_tweaks(ui),
-                    Tab::Privacy => self.page_privacy(ui),
-                    Tab::Troubleshoot => self.page_troubleshoot(ui),
-                    Tab::Security => self.page_security(ui),
-                    Tab::Repair => self.page_repair(ui),
-                    Tab::Tools => self.page_tools(ui),
-                    Tab::Startup => self.page_startup(ui),
-                    Tab::Backup => self.page_backup(ui),
-                    Tab::Settings => self.page_settings(ui),
+                .show(ui, |ui| {
+                    gutter.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        match self.tab {
+                            Tab::Overview => self.page_overview(ui),
+                            Tab::Diagnose => self.full_benchmark_panel(ui),
+                            Tab::SystemInfo => self.page_system_info(ui),
+                            Tab::Hardware => self.page_hardware(ui),
+                            Tab::Memory => self.page_memory(ui),
+                            Tab::Storage => self.page_storage(ui),
+                            Tab::Tweaks => self.page_tweaks(ui),
+                            Tab::Privacy => self.page_privacy(ui),
+                            Tab::Troubleshoot => self.page_troubleshoot(ui),
+                            Tab::Security => self.page_security(ui),
+                            Tab::Repair => self.page_repair(ui),
+                            Tab::Tools => self.page_tools(ui),
+                            Tab::Startup => self.page_startup(ui),
+                            Tab::Backup => self.page_backup(ui),
+                            Tab::Settings => self.page_settings(ui),
+                        }
+                    });
                 });
         });
     }
@@ -2305,35 +2528,86 @@ impl App {
             .iter()
             .any(|t| t.scan.is_some())
             .then_some(scanned.bytes);
-        let health = Health::assess(
-            &self.machine,
-            junk,
-            self.history.cpu.recent_average(30, 15),
-            self.history.gpu_load.recent_average(30, 15),
-            self.history.cpu_temp.recent_average(30, 15),
-            self.history.gpu_temp.recent_average(30, 15),
-            self.history.cpu.len(),
-            self.reliability_event_count(),
-        );
-        self.cache_health(&health);
-        let refresh_incomplete = health.mood == health::Mood::Checking;
-        let cached_score = self.settings.last_health_score;
-        let shown_score = if refresh_incomplete {
-            cached_score.map(|score| score.min(health.score))
-        } else {
-            Some(health.score)
-        };
-        let shown_mood = shown_score
-            .map(health::Mood::from_score)
-            .unwrap_or(health::Mood::Checking);
-        let leading_note = health.notes.iter().min_by_key(|note| match note.severity {
-            health::Severity::Bad => 0,
-            health::Severity::Warn => 1,
-            health::Severity::Info => 2,
+        let health = Health::assess(health::Inputs {
+            machine: &self.machine,
+            junk_bytes: junk,
+            cpu_load_average: self.history.cpu.recent_average(30, 15),
+            gpu_load_average: self.history.gpu_load.recent_average(30, 15),
+            cpu_temperature_average: self.history.cpu_temp.recent_average(30, 15),
+            gpu_temperature_average: self.history.gpu_temp.recent_average(30, 15),
+            reliability_events: self.reliability_event_count(),
+            checks: self.scored_checks(),
         });
+        self.cache_health(&health);
+        // Checking means something is actually running. The mood alone said
+        // "checking" forever once the score came from cache, because nothing
+        // was left to finish and nothing ever would.
+        let busy = self.diagnose_scan_rx.is_some() || self.probe_rx.is_some();
+        // Nothing has produced a figure yet: no cache, no probe, no run. The
+        // face stays neutral rather than reading 50 as "needs attention",
+        // which is a verdict on a machine nobody has looked at.
+        let evaluated = self.settings.last_health_score.is_some()
+            || !self.probe_outcomes.is_empty()
+            || !self.diagnose_outcomes.is_empty();
+        let refresh_incomplete = (busy || !evaluated) && health.mood == health::Mood::Checking;
+        let cached_score = self.settings.last_health_score;
+        // While the first pass is still running there is a figure to show
+        // either way: last session's score if there is one, and a neutral 50
+        // if there is not. The ring used to be blank until the checks landed,
+        // which left the one thing people open this page for missing for the
+        // first few seconds.
+        //
+        // The cached score is held down to the running assessment rather than
+        // shown as-is, so a machine that got worse since last time does not
+        // greet the user with yesterday's good news.
+        let shown_score = Some(if refresh_incomplete {
+            // Deliberately NOT the half-finished assessment, and not the
+            // lower of the two either. A sweep in progress only accumulates
+            // findings -- no check ever hands back credit -- so a partial
+            // score is biased downward by construction, and showing it means
+            // watching the number slide for ten seconds before it settles.
+            // The honest reading while still looking is last session's
+            // figure, or a neutral 50 on a first run.
+            cached_score.unwrap_or(health::NEUTRAL_SCORE)
+        } else {
+            health.score
+        });
+        // The face stays neutral until the pass finishes, whatever the number
+        // reads: a frown drawn from half the evidence is a verdict the tool
+        // has not earned yet.
+        let shown_mood = if refresh_incomplete {
+            health::Mood::Checking
+        } else {
+            shown_score
+                .map(health::Mood::from_score)
+                .unwrap_or(health::Mood::Checking)
+        };
+        // Notes a machine check also reports are left out here, the same way
+        // the Diagnose list leaves them out. The drive one in particular was
+        // the worst note on this machine, so the Overview card said nothing
+        // else for weeks at a time -- a line that never changes stops being
+        // read and starts being noise.
+        let leading_note = health
+            .notes
+            .iter()
+            .filter(|note| !note.also_a_check)
+            .min_by_key(|note| match note.severity {
+                health::Severity::Bad => 0,
+                health::Severity::Warn => 1,
+                health::Severity::Info => 2,
+            });
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+            // Centred against the column beside it, not top-aligned: that
+            // column grew a second line and left the ring hanging above it.
+            //
+            // The height is pinned to the ring's own, because a centring
+            // layout measures against whatever space is available and this
+            // one is inside a card with a whole page below it -- left to
+            // itself it claimed all of it and the card grew to fill the
+            // window.
+            ui.set_height(84.0);
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 let mood_color = shown_mood.color(ui);
                 match shown_score {
                     Some(score) => {
@@ -2364,6 +2638,52 @@ impl App {
                                 .small()
                                 .color(MUTED),
                         );
+                    } else if let Some(delta) = self.health_trend() {
+                        // The comparison belongs with the figure: 74 alone
+                        // says nothing about whether the machine is getting
+                        // better or worse, which is the question somebody
+                        // opening this page actually has.
+                        let (arrow, color) = if delta > 0 {
+                            ("\u{2191}", theme::good(ui))
+                        } else {
+                            ("\u{2193}", theme::bad(ui))
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{arrow} {}", delta.abs()))
+                                    .small()
+                                    .strong()
+                                    .color(color),
+                            );
+                            if let Some(age) = self.health_age_hours() {
+                                ui.label(
+                                    RichText::new(if age < 0.05 {
+                                        "since the last check, just now".to_owned()
+                                    } else {
+                                        format!(
+                                            "since the last check, {} ago",
+                                            crate::util::human_duration(age)
+                                        )
+                                    })
+                                    .small()
+                                    .color(MUTED),
+                                );
+                            }
+                        });
+                    } else if let Some(age) = self.health_age_hours() {
+                        // A score is only worth what its age says it is. The
+                        // cache holds for twelve hours, so without this the
+                        // page can show this morning's figure as if it were
+                        // taken just now.
+                        ui.label(
+                            RichText::new(if age < 0.05 {
+                                "Last checked just now".to_owned()
+                            } else {
+                                format!("Last checked {} ago", crate::util::human_duration(age))
+                            })
+                            .small()
+                            .color(MUTED),
+                        );
                     }
                     if let Some(note) = leading_note.filter(|note| {
                         !refresh_incomplete || note.severity != health::Severity::Info
@@ -2380,24 +2700,34 @@ impl App {
                                 .color(MUTED),
                         );
                     }
-                    ui.add_space(theme::GAP_TIGHT);
-                    if chrome::button(
-                        ui,
-                        chrome::Weight::Primary,
-                        None,
-                        if self.diagnose_scan_rx.is_some() {
-                            "Show the machine checks"
-                        } else {
-                            "Run the machine checks"
-                        },
-                        accent,
-                    )
-                    .pointer()
-                    .clicked()
+                    // Offered when there is a reason to run one. Above 85
+                    // the checks have already been run and found nothing
+                    // worth acting on, and a call to action on a healthy
+                    // machine is an invitation to go looking for a problem
+                    // that is not there. The Diagnose page keeps its own
+                    // button, so nothing becomes unreachable.
+                    if shown_score.is_none_or(|score| score <= 85)
+                        || self.diagnose_scan_rx.is_some()
                     {
-                        self.tab = Tab::Diagnose;
-                        if self.diagnose_scan_rx.is_none() {
-                            self.start_diagnosis(true);
+                        ui.add_space(theme::GAP_TIGHT);
+                        if chrome::button(
+                            ui,
+                            chrome::Weight::Primary,
+                            None,
+                            if self.diagnose_scan_rx.is_some() {
+                                "Show the diagnostic"
+                            } else {
+                                "Run diagnostic"
+                            },
+                            accent,
+                        )
+                        .pointer()
+                        .clicked()
+                        {
+                            self.tab = Tab::Diagnose;
+                            if self.diagnose_scan_rx.is_none() {
+                                self.start_diagnosis(true);
+                            }
                         }
                     }
                 });
@@ -4818,6 +5148,134 @@ impl App {
         }
     }
 
+    /// The live stepper: which check is running, which are done, and how long
+    /// each one took.
+    ///
+    /// Every figure here is measured. The bar is finished checks over the nine
+    /// in `CheckId::ALL`, not a timer dressed up as progress, and each duration
+    /// comes from the worker's own clock around that check. A sweep where DISM
+    /// alone takes fifty seconds therefore sits on one row for fifty seconds,
+    /// which is the honest picture: a bar that creeps along regardless is the
+    /// thing that makes a slow check look like a hang.
+    fn diagnose_progress(&mut self, ui: &mut Ui, accent: Color32) {
+        let scanning = self.diagnose_scan_rx.is_some();
+        // Which run is on screen: the diagnostic once there is one, the
+        // background check before that, and failing both an empty row of what
+        // a diagnostic would look at. The page should say what it does before
+        // it has done anything.
+        let probe_only = !scanning && self.diagnose_outcomes.is_empty();
+        let probe_ran = !self.probe_outcomes.is_empty();
+        // The probe's six results against all eighteen dots would read as a
+        // sweep stuck at 6 of 18 that nothing was going to finish.
+        let steps: Vec<diagnose::CheckId> = diagnose::CheckId::ALL
+            .into_iter()
+            .filter(|id| !(probe_only && probe_ran) || id.in_health_probe())
+            .collect();
+        let (outcomes, durations) = if probe_only {
+            (self.probe_outcomes.clone(), self.probe_durations.clone())
+        } else {
+            (
+                self.diagnose_outcomes.clone(),
+                self.diagnose_durations.clone(),
+            )
+        };
+        let total = steps.len();
+        let done = outcomes.len();
+        let running = self.diagnose_running_check;
+        // The sum of the checks, not a clock on the sweep: the two differ by
+        // the handful of milliseconds spent passing messages, and the figure
+        // worth showing is the one that adds up to the steps beside it.
+        let total_elapsed: Duration = durations.iter().map(|(_, elapsed)| *elapsed).sum();
+
+        let marks: Vec<chrome::Step> = steps
+            .iter()
+            .copied()
+            .map(|id| {
+                let outcome = outcomes.iter().find(|outcome| outcome.id == id);
+                let elapsed = durations
+                    .iter()
+                    .find(|(done_id, _)| *done_id == id)
+                    .map(|(_, elapsed)| *elapsed);
+                // The tooltip is the whole verdict, because this row replaced
+                // the list that used to carry it: name, what it concluded and
+                // what it cost, for the one step being pointed at.
+                let hover = match outcome {
+                    Some(outcome) => format!(
+                        "{} · {}\n{}{}",
+                        id.label(),
+                        outcome.status.label(),
+                        outcome.summary,
+                        elapsed
+                            .map(|elapsed| format!("\n{}", format_elapsed(elapsed)))
+                            .unwrap_or_default()
+                    ),
+                    None if running == Some(id) => {
+                        format!("{} · running now\n{}", id.label(), id.explanation())
+                    }
+                    None => format!("{} · not run yet\n{}", id.label(), id.explanation()),
+                };
+                chrome::Step {
+                    color: outcome.map_or(accent, |outcome| check_color(ui, outcome.status)),
+                    done: outcome.is_some(),
+                    hover,
+                }
+            })
+            .collect();
+        let active = running.and_then(|running| steps.iter().position(|id| *id == running));
+
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(chrome::icon_text(chrome::icon::TROUBLESHOOT, 15.0, accent));
+                ui.add_space(theme::GAP_TIGHT);
+                ui.label(
+                    // The same word the button used. An action that is
+                    // started by "Run diagnostic" and reported by "RUNNING
+                    // CHECKS" makes the user join two names for one thing.
+                    RichText::new(if scanning {
+                        "RUNNING DIAGNOSTIC"
+                    } else if done == 0 {
+                        "NOT RUN YET"
+                    } else if probe_only {
+                        "BACKGROUND CHECK"
+                    } else {
+                        "DIAGNOSTIC COMPLETE"
+                    })
+                    .font(theme::eyebrow())
+                    .color(theme::muted(ui)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(if scanning || done == 0 {
+                            format!("{done} of {total}")
+                        } else {
+                            format!(
+                                "{} in {}",
+                                plural(total, "check"),
+                                format_elapsed(total_elapsed)
+                            )
+                        })
+                        .font(theme::readout())
+                        .color(theme::muted(ui)),
+                    );
+                });
+            });
+            ui.add_space(theme::GAP);
+            chrome::steps(ui, &marks, active, accent, 26.0);
+            ui.add_space(theme::GAP_TIGHT);
+            // One line under the track, and it is the only thing on this card
+            // that changes while the sweep runs: what is being looked at, and
+            // why. Seventeen standing labels would not fit across the window
+            // and are a tooltip away when they are wanted.
+            let caption = match running {
+                Some(id) => format!("{} · {}", id.label(), id.explanation()),
+                None if scanning => "Starting the next check\u{2026}".to_owned(),
+                None => "Point at a step to see what it found.".to_owned(),
+            };
+            ui.add(Label::new(RichText::new(caption).small().color(theme::muted(ui))).truncate());
+        });
+    }
+
     /// One row per machine check: name, verdict pill, and the detail body
     /// behind an accordion.
     ///
@@ -4837,119 +5295,202 @@ impl App {
     /// rows reads top to bottom in a glance, and each check's explanation
     /// moves inside its own details, where it is available to whoever wants
     /// it and silent for everyone else.
-    fn diagnose_check_list(&mut self, ui: &mut Ui, accent: Color32) {
-        chrome::section_heading(ui, chrome::icon::TROUBLESHOOT, "Machine checks", accent);
-        ui.add_space(theme::GAP);
+    /// The whole diagnosis as one JSON document.
+    ///
+    /// Every value here is something a check reported or a counter read. There
+    /// is no score and no summary verdict in the file: a consumer that wants
+    /// one can rank `status` itself, and inventing a grade to export would be
+    /// putting a number on the page that no check produced.
+    ///
+    /// `generated` is UTC, spelled out in the key, because the app carries no
+    /// time zone database and a bare local timestamp in a file that gets
+    /// emailed somewhere is a lie waiting to happen.
+    fn diagnose_report_json(&self) -> serde_json::Value {
+        use serde_json::json;
 
-        let outcomes = self.diagnose_outcomes.clone();
-        let running = self.diagnose_running_check;
-        let scanning = self.diagnose_scan_rx.is_some();
-        let done = outcomes.len();
-        let total = diagnose::CheckId::ALL.len();
+        let checks: Vec<serde_json::Value> = diagnose::CheckId::ALL
+            .into_iter()
+            .map(|id| {
+                let outcome = self
+                    .diagnose_outcomes
+                    .iter()
+                    .find(|outcome| outcome.id == id);
+                let seconds = self
+                    .diagnose_durations
+                    .iter()
+                    .find(|(done_id, _)| *done_id == id)
+                    .map(|(_, elapsed)| elapsed.as_secs_f64());
+                json!({
+                    "check": id.label(),
+                    "question": id.explanation(),
+                    "status": outcome.map(|outcome| outcome.status.label()),
+                    "summary": outcome.map(|outcome| outcome.summary.clone()),
+                    "details": outcome.map(|outcome| outcome.details.clone()).unwrap_or_default(),
+                    "seconds": seconds,
+                })
+            })
+            .collect();
 
+        let events = self.diagnose_event_result.as_ref().map(|result| {
+            json!({
+                "status": match &result.status {
+                    ScanStatus::Complete => "complete".to_owned(),
+                    ScanStatus::Partial => "partial".to_owned(),
+                    ScanStatus::Unsupported => "unsupported".to_owned(),
+                    ScanStatus::Error(error) => format!("error: {error}"),
+                },
+                "log_errors": result.log_errors.clone(),
+                "findings": result
+                    .findings
+                    .iter()
+                    .map(|finding| {
+                        json!({
+                            "source": finding.source,
+                            "event_id": finding.event_id,
+                            "time_local": finding.time,
+                            "message": finding.message,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        });
+
+        json!({
+            "tool": "Windows Wrenchmaster",
+            "version": env!("CARGO_PKG_VERSION"),
+            "generated_utc": tools::timestamp(),
+            "elevated": crate::util::is_elevated(),
+            "machine": {
+                "windows": self.machine.windows_name,
+                "build": self.machine.windows_build,
+                "architecture": self.machine.windows_arch,
+                "cpu": self.machine.cpu,
+                "cpu_cores": self.machine.cpu_cores,
+                "gpus": self.machine.gpus,
+                "motherboard": self.machine.motherboard,
+                "bios": self.machine.bios,
+                "uptime": self.machine.uptime,
+                "uptime_seconds": self.machine.uptime_seconds,
+                "ram_total_bytes": self.machine.ram_total,
+                "ram_used_bytes": self.machine.ram_used,
+                "disks": self
+                    .machine
+                    .disks
+                    .iter()
+                    .map(|disk| {
+                        json!({
+                            "mount": disk.mount,
+                            "total_bytes": disk.total,
+                            "available_bytes": disk.available,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            },
+            "checks": checks,
+            "event_log": events,
+        })
+    }
+
+    /// Write the diagnosis next to wherever the user points the dialog.
+    ///
+    /// The file dialog is modal and does block this thread, which is the one
+    /// place in the app that is allowed: it is the user's own deliberate
+    /// action, nothing is running behind it, and every other save in the app
+    /// already works this way.
+    fn export_diagnosis(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Where should the diagnosis go?")
+            .set_file_name(format!(
+                "wrenchmaster-diagnosis-{}.json",
+                tools::timestamp()
+            ))
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let report = self.diagnose_report_json();
+        match serde_json::to_string_pretty(&report)
+            .map_err(|error| error.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|error| error.to_string()))
+        {
+            Ok(()) => self.say(format!("Saved the diagnosis to {}.", path.display())),
+            Err(error) => self.complain(format!("Could not save the diagnosis: {error}")),
+        }
+    }
+
+    /// The report header: what the diagnosis concluded, in the order it
+    /// matters, with the figures it is based on beside it.
+    ///
+    /// Everything here is derived from a check that ran or a reading that was
+    /// taken. There is no score, no grade and no invented confidence: the lead
+    /// line is the worst finding's own words, and the tiles are counts of
+    /// things that either happened or did not.
+    /// The short answer: the worst few findings, in plain sentences, and
+    /// nothing else.
+    ///
+    /// Most people opening a diagnosis want to know whether anything is wrong
+    /// and what to do about it, in that order, and then to stop reading. The
+    /// full page answers a different question -- what was examined and what
+    /// each check said -- which is the right page for whoever is actually
+    /// fixing the machine and the wrong one for everybody else.
+    ///
+    /// Nothing here is a summary of a summary: these are the same findings,
+    /// ranked the same way, with the long tail cut off rather than rewritten.
+    /// Three is the cut because a list you can act on is a list you can hold
+    /// in your head, and the count says plainly how many were left out.
+    fn diagnose_simple_view(&mut self, ui: &mut Ui, findings: &[Finding]) {
+        let shown = findings.iter().take(3).collect::<Vec<_>>();
         theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("READ-ONLY CHECKS")
-                        .font(theme::eyebrow())
-                        .color(theme::muted(ui)),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if scanning || done > 0 {
-                        ui.label(
-                            RichText::new(format!("{done} of {total}"))
-                                .font(theme::readout())
-                                .color(theme::muted(ui)),
-                        );
-                    }
-                });
-            });
-
-            for (index, id) in diagnose::CheckId::ALL.into_iter().enumerate() {
-                if index > 0 {
-                    // A hairline rather than a gap: the rows are one list and
-                    // have to keep reading as one.
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 1.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().hline(
-                        rect.x_range(),
-                        rect.center().y,
-                        egui::Stroke::new(1.0, theme::line(ui)),
-                    );
-                }
-                let outcome = outcomes.iter().find(|outcome| outcome.id == id);
-                theme::row(ui).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.add(Label::new(RichText::new(id.label()).strong()).truncate());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            match outcome {
-                                Some(outcome) => {
-                                    let color = outcome
-                                        .status
-                                        .severity()
-                                        .map_or(MUTED, |severity| severity.color(ui));
-                                    chrome::pill(ui, outcome.status.label(), color);
-                                }
-                                None if running == Some(id) => {
-                                    ui.spinner();
-                                }
-                                // Before a run there is nothing to report, and
-                                // a row of "Not run" pills down the page was
-                                // nine repetitions of what the empty list
-                                // already says.
-                                None => {}
-                            }
-                        });
-                    });
-
-                    let Some(outcome) = outcome else {
-                        return;
-                    };
+            if shown.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(chrome::icon_text(chrome::icon::HEART, 18.0, theme::good(ui)));
+                    ui.add_space(theme::GAP_TIGHT);
                     ui.add(
-                        Label::new(
-                            RichText::new(&outcome.summary)
-                                .small()
-                                .color(theme::muted(ui)),
-                        )
+                        Label::new(RichText::new(if self.diagnose_outcomes.is_empty() {
+                            "Nothing has been checked yet. Run the checks and the results land here."
+                        } else {
+                            "Nothing needs attention. Every check passed and no reading is out of range."
+                        }))
                         .wrap(),
                     );
-                    if !outcome.details.is_empty() {
-                        let _ = chrome::accordion(
-                            ui,
-                            ("diagnose-check", id.label()),
-                            "Details",
-                            false,
-                            |ui| {
-                                for detail in &outcome.details {
-                                    ui.add(Label::new(RichText::new(detail).small()).wrap());
-                                }
-                                ui.add_space(theme::GAP_TIGHT);
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(id.explanation())
-                                            .small()
-                                            .color(theme::muted(ui)),
-                                    )
-                                    .wrap(),
-                                );
-                            },
+                });
+                return;
+            }
+            for (index, finding) in shown.iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(theme::GAP);
+                }
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        RichText::new("\u{25cf}")
+                            .color(finding.severity.color(ui)),
+                    );
+                    ui.vertical(|ui| {
+                        ui.add(
+                            Label::new(
+                                RichText::new(&finding.title)
+                                    .font(theme::card_title())
+                                    .strong(),
+                            )
+                            .wrap(),
                         );
-                    }
+                        ui.add(
+                            Label::new(RichText::new(&finding.detail).color(theme::muted(ui)))
+                                .wrap(),
+                        );
+                    });
                 });
             }
-
-            if !scanning && outcomes.is_empty() {
-                ui.add_space(theme::GAP_TIGHT);
+            if findings.len() > shown.len() {
+                ui.add_space(theme::GAP);
                 ui.add(
                     Label::new(
-                        RichText::new(
-                            "Not run yet. Every check only reads: none repairs, schedules or \
-                             restarts anything.",
-                        )
+                        RichText::new(format!(
+                            "{} more, in the full view.",
+                            findings.len() - shown.len()
+                        ))
                         .small()
                         .color(theme::muted(ui)),
                     )
@@ -4957,6 +5498,479 @@ impl App {
                 );
             }
         });
+    }
+
+    fn diagnose_findings(&mut self, ui: &mut Ui, accent: Color32, health: &Health) {
+        let mut findings: Vec<Finding> = Vec::new();
+        for outcome in &self.diagnose_outcomes {
+            // A pass, a skip and a check that could not finish are all
+            // "nothing to act on" -- the last two are still visible in the
+            // check list and red in the stepper, where the fact that they did
+            // not answer is the point, but there is no action to rank here.
+            if !outcome.status.is_finding() {
+                continue;
+            }
+            let severity = if outcome.status == diagnose::CheckStatus::Problem {
+                health::Severity::Bad
+            } else {
+                health::Severity::Warn
+            };
+            findings.push(Finding {
+                severity,
+                title: outcome.id.label().to_owned(),
+                detail: outcome.summary.clone(),
+                source: "Machine check",
+            });
+        }
+        let checked = !self.diagnose_outcomes.is_empty();
+        for note in &health.notes {
+            if note.severity == health::Severity::Info {
+                continue;
+            }
+            // A check already said this, in its own words, with a tool button
+            // beside it. Listing both put the same drive on the page twice.
+            if checked && note.also_a_check {
+                continue;
+            }
+            findings.push(Finding {
+                severity: note.severity,
+                title: note.text.clone(),
+                detail: note.recommendation.to_owned(),
+                source: "Live reading",
+            });
+        }
+        findings.sort_by_key(|finding| match finding.severity {
+            health::Severity::Bad => 0,
+            health::Severity::Warn => 1,
+            health::Severity::Info => 2,
+        });
+
+        // Counted from the same ranked list the table below is built from,
+        // not from the check outcomes alone. Counting only checks meant the
+        // tile could read "0 problems" with a red row directly underneath it,
+        // because a live reading -- a nearly full Windows drive -- is a
+        // finding that no check produced. A figure heading a list has to
+        // count that list.
+        let problems = findings
+            .iter()
+            .filter(|finding| finding.severity == health::Severity::Bad)
+            .count();
+        let warnings = findings
+            .iter()
+            .filter(|finding| finding.severity == health::Severity::Warn)
+            .count();
+        let unreadable = self
+            .diagnose_outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome.status,
+                    diagnose::CheckStatus::Error | diagnose::CheckStatus::Skipped
+                )
+            })
+            .count();
+        let events = self.reliability_event_count();
+
+        // Four figures and a coloured edge, and nothing else. It used to
+        // carry the worst finding as a sentence across the top, which was the
+        // same text as the first row of the list directly below it -- the
+        // page saying the same thing twice, in its largest type, and the
+        // reason the block read as cluttered.
+        //
+        // Shown in both views. In the summary it heads the three findings; in
+        // the full report it stands in for the stepper, so the page opens on
+        // what was found rather than on how long each check took.
+        {
+            // No accent bar down the left any more, and the height is the
+            // reason as much as the look. The bar was allocated at
+            // `available_height`, which inside a card is whatever is left of
+            // the page -- so the card stretched itself to several times the
+            // height of its own contents and left a field of empty surface
+            // under four small figures. With the sentence gone the bar had
+            // nothing to mark the start of either.
+            theme::widget(ui)
+                .inner_margin(Margin::symmetric(18, 12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    {
+                        {
+                            // Resolved before the columns close over `ui`: every theme
+                            // colour is a function of the live visuals, and reading one
+                            // inside the closure borrows what the closure already holds.
+                            let problem_color = if problems > 0 { theme::bad(ui) } else { MUTED };
+                            let warning_color = if warnings > 0 { theme::warn(ui) } else { MUTED };
+                            let event_tile_color = if events.is_some_and(|count| count > 0) {
+                                theme::warn(ui)
+                            } else {
+                                MUTED
+                            };
+                            let event_tile_value = events
+                                .map_or_else(|| "\u{2014}".to_owned(), |count| count.to_string());
+                            ui.columns(4, |columns| {
+                                stat(
+                                    &mut columns[0],
+                                    "PROBLEMS",
+                                    &problems.to_string(),
+                                    problem_color,
+                                );
+                                stat(
+                                    &mut columns[1],
+                                    "WARNINGS",
+                                    &warnings.to_string(),
+                                    warning_color,
+                                );
+                                stat(
+                                    &mut columns[2],
+                                    "NOT CHECKED",
+                                    &unreadable.to_string(),
+                                    MUTED,
+                                );
+                                stat(
+                                    &mut columns[3],
+                                    "EVENTS, 24 H",
+                                    &event_tile_value,
+                                    event_tile_color,
+                                );
+                            });
+                        }
+                    }
+                });
+        }
+
+        // The short view takes the same ranked list and stops after three.
+        if self.diagnose_simple {
+            ui.add_space(theme::GAP);
+            self.diagnose_simple_view(ui, &findings);
+            return;
+        }
+
+        if findings.is_empty() {
+            return;
+        }
+
+        ui.add_space(theme::GAP);
+        let worst = findings
+            .iter()
+            .filter(|finding| finding.severity == health::Severity::Bad)
+            .count();
+        let headline = if worst > 0 {
+            format!("{worst} serious, {} in total", findings.len())
+        } else {
+            format!("{} to look at", findings.len())
+        };
+        // Open by default, and the only section on the page that is. It is the
+        // answer to the question the user came with; the others are evidence
+        // for it, and the group rule shuts this one the moment they go looking
+        // at any of them.
+        let _ = chrome::accordion_panel(
+            ui,
+            "diagnose-what-went-wrong",
+            chrome::icon::DIAGNOSTICS,
+            "What went wrong",
+            &headline,
+            // Red from the closed header when something serious is inside.
+            // A section that folds away has one line to say whether it is
+            // worth opening, and "3 serious" in the same grey as "none" is
+            // that line wasted.
+            (worst > 0).then(|| theme::bad(ui)),
+            accent,
+            true,
+            |ui| {
+                for (index, finding) in findings.iter().enumerate() {
+                    if index > 0 {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 1.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.center().y,
+                            egui::Stroke::new(1.0, theme::line(ui)),
+                        );
+                    }
+                    theme::row(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_top(|ui| {
+                            ui.label(
+                                RichText::new("\u{25cf}")
+                                    .small()
+                                    .color(finding.severity.color(ui)),
+                            );
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    // The provenance is laid out first: the title
+                                    // beside it wraps, and a wrapping label left
+                                    // to itself takes the whole row.
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            RichText::new(finding.source)
+                                                .small()
+                                                .color(theme::faint(ui)),
+                                        );
+                                        ui.with_layout(
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    Label::new(
+                                                        RichText::new(&finding.title).strong(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+                                    });
+                                });
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(&finding.detail)
+                                            .small()
+                                            .color(theme::muted(ui)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        });
+                    });
+                }
+            },
+        );
+    }
+
+    fn diagnose_check_list(&mut self, ui: &mut Ui, accent: Color32) {
+        let outcomes = self.diagnose_outcomes.clone();
+        let running = self.diagnose_running_check;
+        let scanning = self.diagnose_scan_rx.is_some();
+        let done = outcomes.len();
+        let total = diagnose::CheckId::ALL.len();
+
+        // The verdict goes in the accordion header. A closed section labelled
+        // only "Machine checks" makes every reader open nine rows to find out
+        // whether any of them matters; the tally answers that from outside.
+        let tally = |wanted: &[diagnose::CheckStatus]| {
+            outcomes
+                .iter()
+                .filter(|outcome| wanted.contains(&outcome.status))
+                .count()
+        };
+        let problems = tally(&[diagnose::CheckStatus::Problem]);
+        let warnings = tally(&[
+            diagnose::CheckStatus::Warning,
+            diagnose::CheckStatus::NeedsAdmin,
+        ]);
+        let passes = tally(&[diagnose::CheckStatus::Pass]);
+        let unknown = tally(&[diagnose::CheckStatus::Skipped, diagnose::CheckStatus::Error]);
+        let summary = if scanning {
+            format!("{done} of {total} run")
+        } else if outcomes.is_empty() {
+            "not run yet".to_owned()
+        } else {
+            let mut parts = Vec::new();
+            if problems > 0 {
+                parts.push(plural(problems, "problem"));
+            }
+            if warnings > 0 {
+                parts.push(plural(warnings, "warning"));
+            }
+            if unknown > 0 {
+                parts.push(format!("{unknown} not checked"));
+            }
+            if passes > 0 {
+                parts.push(format!("{passes} pass"));
+            }
+            parts.join(" \u{b7} ")
+        };
+
+        // Set by a row and acted on after the closure returns: the rows are
+        // drawn from a clone, so `self` is not reachable from inside them.
+        let mut requested: Option<Action> = None;
+        let mut go_to_cleanup = false;
+
+        let _ = chrome::accordion_panel(
+            ui,
+            "diagnose-machine-checks",
+            chrome::icon::TROUBLESHOOT,
+            "Machine checks",
+            &summary,
+            if problems > 0 {
+                Some(theme::bad(ui))
+            } else if warnings > 0 {
+                Some(theme::warn(ui))
+            } else {
+                None
+            },
+            accent,
+            false,
+            |ui| {
+                ui.set_width(ui.available_width());
+                for (index, id) in diagnose::CheckId::ALL.into_iter().enumerate() {
+                    if index > 0 {
+                        // A hairline rather than a gap: the rows are one
+                        // list and have to keep reading as one.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 1.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.center().y,
+                            egui::Stroke::new(1.0, theme::line(ui)),
+                        );
+                    }
+                    let outcome = outcomes.iter().find(|outcome| outcome.id == id);
+                    let verdict = outcome.map(|outcome| check_color(ui, outcome.status));
+                    // The verdict is a bar down the left edge rather than a
+                    // pill on the right. Eighteen pills spelling Pass, Pass,
+                    // Pass down a column is one word repeated, read once and
+                    // ignored thereafter; a colour at the start of the row is
+                    // taken in by the same glance that finds the row. The
+                    // status is still written out in the summary line under
+                    // it and in the stepper's tooltip, so nothing is lost but
+                    // the repetition.
+                    let row = theme::row(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        // The indent past the colour bar is applied once, to
+                        // the whole row, rather than to the title alone --
+                        // which is what left the summary and the buttons
+                        // starting a step to the left of the name they
+                        // belong to.
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(theme::GAP);
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        Label::new(RichText::new(id.label()).strong()).truncate(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if outcome.is_none() && running == Some(id) {
+                                            ui.spinner();
+                                        }
+                                    });
+                                });
+
+                                let Some(outcome) = outcome else {
+                                    return;
+                                };
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(&outcome.summary)
+                                            .small()
+                                            .color(theme::muted(ui)),
+                                    )
+                                    .wrap(),
+                                );
+                                // The verdict and the tool that acts on it sit
+                                // together, because a row reading "a restart is
+                                // pending" with no way to go and look at it is
+                                // only half an answer.
+                                //
+                                // Only on a row that found something, though. Seven
+                                // "Open Device Manager" buttons down a list of
+                                // passes is seven invitations to go and look at
+                                // nothing, and it buries the one row that meant it.
+                                let worth_opening = !matches!(
+                                    outcome.status,
+                                    diagnose::CheckStatus::Pass | diagnose::CheckStatus::Skipped
+                                );
+                                // Right-aligned, on one line. Left-aligned under the
+                                // summary they read as another sentence; against the
+                                // right edge they read as the row's actions, and two
+                                // of them sit together instead of stacking.
+                                let tool = id.tool().filter(|_| worth_opening);
+                                let cleanup =
+                                    worth_opening && id == diagnose::CheckId::StorageSpace;
+                                if tool.is_some() || cleanup {
+                                    ui.add_space(theme::GAP_TIGHT);
+                                    ui.horizontal(|ui| {
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if let Some((label, target)) = tool {
+                                                    if ghost(ui, label).pointer().clicked() {
+                                                        requested = Some(tools::shell_action(
+                                                            label, target,
+                                                        ));
+                                                    }
+                                                }
+                                                if cleanup
+                                                    && ghost(ui, "Free up space")
+                                                        .pointer()
+                                                        .clicked()
+                                                {
+                                                    go_to_cleanup = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                                if !outcome.details.is_empty() {
+                                    let _ = chrome::accordion(
+                                        ui,
+                                        ("diagnose-check", id.label()),
+                                        "Details",
+                                        false,
+                                        |ui| {
+                                            for detail in &outcome.details {
+                                                ui.add(
+                                                    Label::new(RichText::new(detail).small())
+                                                        .wrap(),
+                                                );
+                                            }
+                                            ui.add_space(theme::GAP_TIGHT);
+                                            ui.add(
+                                                Label::new(
+                                                    RichText::new(id.explanation())
+                                                        .small()
+                                                        .color(theme::muted(ui)),
+                                                )
+                                                .wrap(),
+                                            );
+                                        },
+                                    );
+                                }
+                            });
+                        });
+                    });
+                    // Painted after the body, because only then is the row's
+                    // height known: a check with its details open is several
+                    // times the height of one without, and a bar drawn to a
+                    // guessed height is the thing that looks broken.
+                    if let Some(color) = verdict {
+                        let rect = row.response.rect;
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.left(), rect.top() + 3.0),
+                                egui::pos2(rect.left() + 3.0, rect.bottom() - 3.0),
+                            ),
+                            egui::CornerRadius::same(2),
+                            color,
+                        );
+                    }
+                }
+
+                if !scanning && outcomes.is_empty() {
+                    ui.add(
+                        Label::new(
+                            RichText::new(
+                                "Not run yet. Every check only reads: none repairs, \
+                                     schedules or restarts anything.",
+                            )
+                            .small()
+                            .color(theme::muted(ui)),
+                        )
+                        .wrap(),
+                    );
+                }
+            },
+        );
+
+        if let Some(action) = requested {
+            self.launch_action(action);
+        }
+        if go_to_cleanup {
+            self.tab = Tab::Storage;
+            self.storage_view = StorageView::Cleanup;
+            self.expand_group(NavGroup::Storage);
+        }
     }
 
     fn full_benchmark_panel(&mut self, ui: &mut Ui) {
@@ -4967,16 +5981,16 @@ impl App {
             .iter()
             .any(|target| target.scan.is_some())
             .then_some(scanned.bytes);
-        let health = Health::assess(
-            &self.machine,
-            junk,
-            self.history.cpu.recent_average(30, 15),
-            self.history.gpu_load.recent_average(30, 15),
-            self.history.cpu_temp.recent_average(30, 15),
-            self.history.gpu_temp.recent_average(30, 15),
-            self.history.cpu.len(),
-            self.reliability_event_count(),
-        );
+        let health = Health::assess(health::Inputs {
+            machine: &self.machine,
+            junk_bytes: junk,
+            cpu_load_average: self.history.cpu.recent_average(30, 15),
+            gpu_load_average: self.history.gpu_load.recent_average(30, 15),
+            cpu_temperature_average: self.history.cpu_temp.recent_average(30, 15),
+            gpu_temperature_average: self.history.gpu_temp.recent_average(30, 15),
+            reliability_events: self.reliability_event_count(),
+            checks: self.scored_checks(),
+        });
         self.cache_health(&health);
 
         let benchmark_running = self.diagnose_scan_rx.is_some();
@@ -4985,18 +5999,29 @@ impl App {
         // beside it repeated the tab blurb two lines above, and an unwrapped
         // label inside a horizontal row grows the row until the right-aligned
         // button is pushed off the edge of the page.
+        let mut export = false;
         ui.horizontal(|ui| {
+            // The view switch sits on the left, where it is read before the
+            // page under it rather than discovered after scrolling it.
+            for (label, simple) in [("Summary", true), ("Full report", false)] {
+                if chrome::segment(ui, label, self.diagnose_simple == simple, accent)
+                    .pointer()
+                    .clicked()
+                {
+                    self.diagnose_simple = simple;
+                }
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if chrome::button(
                     ui,
                     chrome::Weight::Primary,
                     None,
                     if benchmark_running {
-                        "Running checks…"
+                        "Running diagnostic…"
                     } else if have_outcomes {
-                        "Run the checks again"
+                        "Run diagnostic again"
                     } else {
-                        "Run the checks"
+                        "Run diagnostic"
                     },
                     accent,
                 )
@@ -5006,365 +6031,225 @@ impl App {
                 {
                     self.start_diagnosis(true);
                 }
-            });
-        });
-        ui.add_space(theme::GAP_SECTION);
-
-        let cpu_color = if self.cpu_usage > 90.0 {
-            theme::warn(ui)
-        } else {
-            accent
-        };
-        let memory_fraction = self.machine.ram_fraction().clamp(0.0, 1.0);
-        let memory_color = if memory_fraction > 0.95 {
-            theme::bad(ui)
-        } else if memory_fraction > 0.85 {
-            theme::warn(ui)
-        } else {
-            accent
-        };
-        let memory_status = if memory_fraction > 0.95 {
-            "Very high"
-        } else if memory_fraction > 0.85 {
-            "High"
-        } else {
-            "Normal"
-        };
-        let cpu_status = if self.cpu_usage > 90.0 {
-            "High"
-        } else {
-            "Normal"
-        };
-        let cpu_detail = if self.cpu_usage > 90.0 {
-            "High now · see busiest apps in details"
-        } else {
-            "Current processor activity"
-        };
-        let system_drive = self
-            .machine
-            .disks
-            .iter()
-            .find(|disk| crate::machine::is_system_drive_mount(&disk.mount));
-        let drive_summary = system_drive.map(|disk| {
-            (
-                format!("{:.0}%", disk.used_fraction() * 100.0),
-                format!("{} free", human_bytes(disk.available)),
-                disk.used_fraction(),
-            )
-        });
-        let drive_color = drive_summary
-            .as_ref()
-            .filter(|(_, _, fraction)| *fraction >= 0.90)
-            .map_or(accent, |_| theme::warn(ui));
-        let drive_status = drive_summary
-            .as_ref()
-            .map(|(_, _, fraction)| {
-                if *fraction >= 0.90 {
-                    "Low space"
-                } else {
-                    "Available"
+                // Offered only once there is a diagnosis to export. A button
+                // that writes an empty report is a button that produces a file
+                // the user then has to work out is empty.
+                if have_outcomes && !benchmark_running {
+                    ui.add_space(theme::GAP_TIGHT);
+                    export = ghost(ui, "Export JSON").pointer().clicked();
                 }
-            })
-            .unwrap_or("Not found");
-        let event_count = self.reliability_event_count();
-        let event_value = event_count
-            .map(|count| count.to_string())
-            .unwrap_or_else(|| "…".into());
-        let event_color = if event_count.is_some_and(|count| count > 0) {
-            theme::warn(ui)
-        } else if event_count.is_some() {
-            theme::good(ui)
-        } else {
-            MUTED
-        };
-
-        ui.columns(2, |columns| {
-            metric_widget(
-                &mut columns[0],
-                chrome::icon::DEVICES,
-                "Processor",
-                &format!("{:.0}%", self.cpu_usage),
-                cpu_status,
-                cpu_detail,
-                Some(self.cpu_usage / 100.0),
-                cpu_color,
-            );
-            metric_widget(
-                &mut columns[1],
-                chrome::icon::MEMORY,
-                "Memory",
-                &format!("{:.0}%", memory_fraction * 100.0),
-                memory_status,
-                &self.machine.ram_summary(),
-                Some(memory_fraction),
-                memory_color,
-            );
-            columns[0].add_space(theme::GAP);
-            if let Some((value, detail, fraction)) = &drive_summary {
-                metric_widget(
-                    &mut columns[0],
-                    chrome::icon::STORAGE,
-                    "Windows drive",
-                    value,
-                    drive_status,
-                    detail,
-                    Some(*fraction),
-                    drive_color,
-                );
-            } else {
-                metric_widget(
-                    &mut columns[0],
-                    chrome::icon::STORAGE,
-                    "Windows drive",
-                    "—",
-                    drive_status,
-                    "Windows drive not identified",
-                    None,
-                    MUTED,
-                );
-            }
-            columns[1].add_space(theme::GAP);
-            let reliability_status = if event_count.is_none() {
-                "Checking"
-            } else if event_count.is_some_and(|count| count > 0) {
-                "Review"
-            } else {
-                "Clear"
-            };
-            metric_widget(
-                &mut columns[1],
-                chrome::icon::DIAGNOSTICS,
-                "Windows reliability",
-                &event_value,
-                reliability_status,
-                "Critical and error events in the last 24 hours",
-                None,
-                event_color,
-            );
-        });
-        ui.add_space(theme::GAP_SECTION);
-        chrome::section_heading(
-            ui,
-            chrome::icon::DIAGNOSTICS,
-            "What needs attention",
-            accent,
-        );
-        let mut action_notes = health
-            .notes
-            .iter()
-            .filter(|note| note.severity != health::Severity::Info)
-            .collect::<Vec<_>>();
-        action_notes.sort_by_key(|note| match note.severity {
-            health::Severity::Bad => 0,
-            health::Severity::Warn => 1,
-            health::Severity::Info => 2,
-        });
-        if action_notes.is_empty() {
-            theme::row(ui).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("✓").color(theme::good(ui)));
-                    ui.label("No urgent performance or reliability issue is showing right now.");
-                });
             });
-        } else {
-            for note in action_notes.iter().take(4) {
-                theme::row(ui).show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
-                        ui.label(RichText::new("●").strong().color(note.severity.color(ui)));
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&note.text).strong());
-                            ui.add(
-                                Label::new(RichText::new(note.recommendation).small().color(MUTED))
-                                    .wrap(),
-                            );
-                        });
-                    });
-                });
-            }
-            if action_notes.len() > 4 {
-                let _ = chrome::accordion(
-                    ui,
-                    "health-more-notes",
-                    &format!("{} more items", action_notes.len() - 4),
-                    false,
-                    |ui| {
-                        for note in action_notes.iter().skip(4) {
-                            theme::row(ui).show(ui, |ui| {
-                                ui.horizontal_top(|ui| {
-                                    ui.label(RichText::new("●").color(note.severity.color(ui)));
-                                    ui.vertical(|ui| {
-                                        ui.label(&note.text);
-                                        ui.add(
-                                            Label::new(
-                                                RichText::new(note.recommendation)
-                                                    .small()
-                                                    .color(MUTED),
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
-                                });
-                            });
-                        }
-                    },
-                );
-            }
+        });
+        if export {
+            self.export_diagnosis();
+        }
+        ui.add_space(theme::GAP_SECTION);
+
+        // The stepper belongs to the summary, where it is the record of what
+        // was looked at and what each check cost. The full report opens on the
+        // counts instead and goes straight into the sections: a reader who
+        // chose the evidence does not need eighteen dots telling them it was
+        // gathered.
+        //
+        // The exception is a run in progress, in either view. A diagnostic
+        // with no visible progress is the thing that makes people click the
+        // button again.
+        if benchmark_running || self.diagnose_simple {
+            self.diagnose_progress(ui, accent);
+            ui.add_space(theme::GAP_SECTION);
+        }
+
+        // The processor, memory and Windows-drive tiles that used to stand
+        // here are gone, and so has the Windows reliability band that replaced
+        // them. All of those figures are read live on the Overview and on the
+        // System pages, and the reliability count is already one of the four
+        // figures in the summary callout below -- a band above it repeating
+        // that number was the page using a sixth of the screen to say the
+        // same thing twice.
+        self.diagnose_findings(ui, accent, &health);
+
+        // Everything below is the evidence behind the summary above, which is
+        // exactly what the short view exists not to show.
+        if self.diagnose_simple {
+            return;
         }
 
         ui.add_space(theme::GAP_SECTION);
         self.diagnose_check_list(ui, accent);
 
         ui.add_space(theme::GAP);
-        let _ = chrome::accordion(
+        // Live figures, which is why they sit behind a disclosure rather than
+        // on the page. The header says what they currently read, so the
+        // section can stay shut without hiding the number that would matter.
+        let performance_summary = format!(
+            "CPU {:.0}% · RAM {:.0}%",
+            self.cpu_usage,
+            self.machine.ram_fraction() * 100.0
+        );
+        let _ = chrome::accordion_panel(
             ui,
             "detailed-performance",
+            chrome::icon::CHART,
             "Detailed performance readings",
+            &performance_summary,
+            None,
+            accent,
             false,
             |ui| {
-                theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            chrome::meter(
-                ui,
-                self.cpu_usage / 100.0,
-                if self.cpu_usage > 90.0 {
-                    theme::warn(ui)
-                } else {
-                    self.accent
-                },
-                Some(&format!("CPU load now  {:.0}%", self.cpu_usage)),
-            );
-            if self.cpu_usage > 90.0 {
-                ui.label(
-                    RichText::new("CPU load is currently high; check active processes below.")
-                        .color(theme::warn(ui)),
+                ui.set_width(ui.available_width());
+                chrome::meter(
+                    ui,
+                    self.cpu_usage / 100.0,
+                    if self.cpu_usage > 90.0 {
+                        theme::warn(ui)
+                    } else {
+                        self.accent
+                    },
+                    Some(&format!("CPU load now  {:.0}%", self.cpu_usage)),
                 );
-            }
-            let mut cpu_processes: Vec<_> = self
-                .cpu_monitor
-                .processes()
-                .iter()
-                .filter(|(pid, _)| pid.as_u32() > 4 && pid.as_u32() != std::process::id())
-                .map(|(pid, process)| {
-                    (
-                        process.name().to_string_lossy().into_owned(),
-                        pid.as_u32(),
-                        process.cpu_usage(),
-                    )
-                })
-                .collect();
-            cpu_processes.sort_by(|a, b| b.2.total_cmp(&a.2));
-            if !cpu_processes.is_empty() {
-                let _ = chrome::accordion(ui, "largest-cpu-users", "Largest current CPU users", false, |ui| {
-                    for (name, pid, usage) in cpu_processes.iter().take(5) {
-                        ui.label(format!("{name}  ·  {usage:.0}%  ·  PID {pid}"));
-                    }
+                if self.cpu_usage > 90.0 {
                     ui.label(
+                        RichText::new("CPU load is currently high; check active processes below.")
+                            .color(theme::warn(ui)),
+                    );
+                }
+                let mut cpu_processes: Vec<_> = self
+                    .cpu_monitor
+                    .processes()
+                    .iter()
+                    .filter(|(pid, _)| pid.as_u32() > 4 && pid.as_u32() != std::process::id())
+                    .map(|(pid, process)| {
+                        (
+                            process.name().to_string_lossy().into_owned(),
+                            pid.as_u32(),
+                            process.cpu_usage(),
+                        )
+                    })
+                    .collect();
+                cpu_processes.sort_by(|a, b| b.2.total_cmp(&a.2));
+                if !cpu_processes.is_empty() {
+                    let _ = chrome::accordion(
+                        ui,
+                        "largest-cpu-users",
+                        "Largest current CPU users",
+                        false,
+                        |ui| {
+                            for (name, pid, usage) in cpu_processes.iter().take(5) {
+                                ui.label(format!("{name}  ·  {usage:.0}%  ·  PID {pid}"));
+                            }
+                            ui.label(
                         RichText::new(
                             "Process CPU readings update with Windows process sampling and can briefly lag behind total CPU load.",
                         )
                         .small()
                         .color(MUTED),
                     );
-                });
-            }
-            // A failed read still has to be said, because the Memory tile at
-            // the top of the page falls back to a different counter and will
-            // happily show a figure when this one is unavailable.
-            if self.ram_snapshot.is_none() {
-                if let Some(error) = &self.ram_error {
-                    ui.label(
-                        RichText::new(format!("Memory counters unavailable: {error}"))
-                            .small()
-                            .color(MUTED),
+                        },
                     );
                 }
-            }
-            let system_drive = self
-                .machine
-                .disks
-                .iter()
-                .find(|disk| crate::machine::is_system_drive_mount(&disk.mount));
-            match system_drive {
-                Some(disk) if disk.used_fraction() >= 0.90 => ui.label(
-                    RichText::new(format!(
-                        "Low free space: Windows drive {} is {:.0}% full ({} free)",
-                        disk.mount.trim_end_matches('\\'),
-                        disk.used_fraction() * 100.0,
-                        human_bytes(disk.available)
-                    ))
-                    .color(theme::warn(ui)),
-                ),
-                Some(_) => ui.label(
-                    RichText::new("Windows drive: no low-space warning.")
-                        .small()
-                        .color(MUTED),
-                ),
-                None => ui.label(
-                    RichText::new("Windows system drive could not be identified.")
-                        .small()
-                        .color(MUTED),
-                ),
-            };
-            if !self.ram_processes.is_empty() {
-                let _ = chrome::accordion(ui, "largest-memory-users", "Largest process memory use", false, |ui| {
-                    for process in self.ram_processes.iter().take(5) {
-                        ui.label(format!(
-                            "{}  ·  {}",
-                            process.name,
-                            human_bytes(process.working_set_bytes)
-                        ));
+                // A failed read still has to be said, because the Memory tile at
+                // the top of the page falls back to a different counter and will
+                // happily show a figure when this one is unavailable.
+                if self.ram_snapshot.is_none() {
+                    if let Some(error) = &self.ram_error {
+                        ui.label(
+                            RichText::new(format!("Memory counters unavailable: {error}"))
+                                .small()
+                                .color(MUTED),
+                        );
                     }
-                    ui.label(
+                }
+                let system_drive = self
+                    .machine
+                    .disks
+                    .iter()
+                    .find(|disk| crate::machine::is_system_drive_mount(&disk.mount));
+                match system_drive {
+                    Some(disk) if disk.used_fraction() >= 0.90 => ui.label(
+                        RichText::new(format!(
+                            "Low free space: Windows drive {} is {:.0}% full ({} free)",
+                            disk.mount.trim_end_matches('\\'),
+                            disk.used_fraction() * 100.0,
+                            human_bytes(disk.available)
+                        ))
+                        .color(theme::warn(ui)),
+                    ),
+                    Some(_) => ui.label(
+                        RichText::new("Windows drive: no low-space warning.")
+                            .small()
+                            .color(MUTED),
+                    ),
+                    None => ui.label(
+                        RichText::new("Windows system drive could not be identified.")
+                            .small()
+                            .color(MUTED),
+                    ),
+                };
+                if !self.ram_processes.is_empty() {
+                    let _ = chrome::accordion(
+                        ui,
+                        "largest-memory-users",
+                        "Largest process memory use",
+                        false,
+                        |ui| {
+                            for process in self.ram_processes.iter().take(5) {
+                                ui.label(format!(
+                                    "{}  ·  {}",
+                                    process.name,
+                                    human_bytes(process.working_set_bytes)
+                                ));
+                            }
+                            ui.label(
                         RichText::new(
                             "Shared memory means these values do not add up to total RAM use.",
                         )
                         .small()
                         .color(MUTED),
                     );
-                });
-            }
-            ui.add_space(theme::GAP);
-            ui.label(
-                RichText::new("Reported device temperatures")
-                    .small()
-                    .strong(),
-            );
-            let temperatures: Vec<_> = self
-                .hardware_telemetry
-                .iter()
-                .filter(|reading| reading.sensor_type.eq_ignore_ascii_case("Temperature"))
-                .collect();
-            if temperatures.is_empty() {
-                let explanation = self
-                    .hardware_sensor_error
-                    .as_deref()
-                    .unwrap_or_else(|| self.temperature_hint());
-                ui.label(RichText::new(explanation).small().color(MUTED));
-            } else {
-                for reading in temperatures.iter().take(12) {
-                    // Celsius is written here rather than taken from the
-                    // provider, whose unit text does not survive decoding.
-                    // Readings arrive as 51.40625; one decimal is plenty.
-                    let celsius = reading.value.trim().parse::<f32>().ok();
-                    let shown = match celsius {
-                        Some(v) => format!("{v:.1} °C"),
-                        None => reading.value.clone(),
-                    };
-                    let color = celsius.map_or(MUTED, |c| chrome::temp_color(ui, c));
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {}",
-                                reading.hardware_name, reading.sensor_name
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                        ui.label(RichText::new(shown).font(theme::readout()).color(color));
-                    });
+                        },
+                    );
                 }
-            }
-        });
+                ui.add_space(theme::GAP);
+                ui.label(
+                    RichText::new("Reported device temperatures")
+                        .small()
+                        .strong(),
+                );
+                let temperatures: Vec<_> = self
+                    .hardware_telemetry
+                    .iter()
+                    .filter(|reading| reading.sensor_type.eq_ignore_ascii_case("Temperature"))
+                    .collect();
+                if temperatures.is_empty() {
+                    let explanation = self
+                        .hardware_sensor_error
+                        .as_deref()
+                        .unwrap_or_else(|| self.temperature_hint());
+                    ui.label(RichText::new(explanation).small().color(MUTED));
+                } else {
+                    for reading in temperatures.iter().take(12) {
+                        // Celsius is written here rather than taken from the
+                        // provider, whose unit text does not survive decoding.
+                        // Readings arrive as 51.40625; one decimal is plenty.
+                        let celsius = reading.value.trim().parse::<f32>().ok();
+                        let shown = match celsius {
+                            Some(v) => format!("{v:.1} °C"),
+                            None => reading.value.clone(),
+                        };
+                        let color = celsius.map_or(MUTED, |c| chrome::temp_color(ui, c));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    reading.hardware_name, reading.sensor_name
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                            ui.label(RichText::new(shown).font(theme::readout()).color(color));
+                        });
+                    }
+                }
             },
         );
 
@@ -5382,39 +6267,68 @@ impl App {
         } else {
             "Not checked yet".to_string()
         };
-        let _ = chrome::accordion(
+        let _ = chrome::accordion_panel(
             ui,
             "windows-event-log",
-            &format!("Windows event log · {event_summary}"),
+            chrome::icon::EVENTS,
+            "Windows event log",
+            &event_summary,
+            // Amber only when there is something in the log. The count is a
+            // finding, not a fault: events get investigated, not fixed.
+            self.reliability_event_count()
+                .is_some_and(|count| count > 0)
+                .then(|| theme::warn(ui)),
+            accent,
             false,
             |ui| {
-                theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new("System and Application logs · Critical and Error events · past 24 hours").small().color(MUTED));
-            if self.diagnose_events_pending() {
-                ui.add_space(theme::GAP);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Reading Windows events…");
-                });
-            } else if let Some(result) = &self.diagnose_event_result {
-                match &result.status {
-                    ScanStatus::Complete => ui.label(format!("Checked both logs. {} critical/error event(s) found.", result.findings.len())),
-                    ScanStatus::Partial => ui.label(RichText::new(format!("Partial event check. {} event(s) found; some log data could not be read.", result.findings.len())).color(theme::warn(ui))),
-                    ScanStatus::Unsupported => ui.label(RichText::new("Windows event checks are available on Windows only.").color(MUTED)),
-                    ScanStatus::Error(error) => ui.label(RichText::new(format!("Could not check Windows events: {error}")).color(theme::warn(ui))),
-                };
-                for error in &result.log_errors {
-                    ui.label(RichText::new(error).small().color(theme::warn(ui)));
-                }
-                if result.findings.is_empty() && matches!(&result.status, ScanStatus::Complete) {
-                    ui.add_space(theme::GAP_TIGHT);
-                    ui.label(RichText::new("No Critical or Error events were recorded in the selected logs during this period.").color(theme::good(ui)));
-                } else if !result.findings.is_empty() {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(
+                        "System and Application logs · Critical and Error events · past 24 hours",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                if self.diagnose_events_pending() {
                     ui.add_space(theme::GAP);
-                    ui.label(RichText::new("These entries are clues to investigate; a log event alone does not prove the cause of a slowdown.").small().color(MUTED));
-                    ui.label(RichText::new("Next: compare repeated event sources and timestamps with the freezes, crashes, or slowdowns you noticed.").small().color(MUTED));
-                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Reading Windows events…");
+                    });
+                } else if let Some(result) = &self.diagnose_event_result {
+                    match &result.status {
+                        ScanStatus::Complete => ui.label(format!(
+                            "Checked both logs. {} found.",
+                            plural(result.findings.len(), "critical or error event")
+                        )),
+                        ScanStatus::Partial => ui.label(
+                            RichText::new(format!(
+                                "Partial event check. {} found; some log data could not be read.",
+                                plural(result.findings.len(), "event")
+                            ))
+                            .color(theme::warn(ui)),
+                        ),
+                        ScanStatus::Unsupported => ui.label(
+                            RichText::new("Windows event checks are available on Windows only.")
+                                .color(MUTED),
+                        ),
+                        ScanStatus::Error(error) => ui.label(
+                            RichText::new(format!("Could not check Windows events: {error}"))
+                                .color(theme::warn(ui)),
+                        ),
+                    };
+                    for error in &result.log_errors {
+                        ui.label(RichText::new(error).small().color(theme::warn(ui)));
+                    }
+                    if result.findings.is_empty() && matches!(&result.status, ScanStatus::Complete)
+                    {
+                        ui.add_space(theme::GAP_TIGHT);
+                        ui.label(RichText::new("No Critical or Error events were recorded in the selected logs during this period.").color(theme::good(ui)));
+                    } else if !result.findings.is_empty() {
+                        ui.add_space(theme::GAP);
+                        ui.label(RichText::new("These entries are clues to investigate; a log event alone does not prove the cause of a slowdown.").small().color(MUTED));
+                        ui.label(RichText::new("Next: compare repeated event sources and timestamps with the freezes, crashes, or slowdowns you noticed.").small().color(MUTED));
+                        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                         for (index, finding) in result.findings.iter().take(30).enumerate() {
                             draw_diagnostic_event(ui, index, finding);
                         }
@@ -5422,9 +6336,8 @@ impl App {
                             ui.label(RichText::new(format!("Showing 30 of {} events (up to 100 per log are checked).", result.findings.len())).small().color(MUTED));
                         }
                     });
+                    }
                 }
-            }
-        });
             },
         );
     }
@@ -5477,7 +6390,7 @@ impl App {
                     ui.label(chrome::icon_text(chrome::icon::SHIELD, 22.0, status_color));
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Windows Explorer integrity").strong());
-                        ui.label(format!("{} running instance(s)", result.processes.len()));
+                        ui.label(plural(result.processes.len(), "running instance"));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         chrome::pill(
@@ -7069,8 +7982,26 @@ fn reading_card(
                     .truncate(),
                 );
             }
+            // The caption goes under the bar in the small muted type, not
+            // into the meter's own label line. Passed to the meter it was set
+            // in the reading font on the same row as the percentage, so the
+            // drive card read as two competing figures while the three cards
+            // beside it kept their caption quietly underneath.
+            //
+            // The bar is then padded out to the height a sparkline would have
+            // taken, so the caption lands on the same line as the captions on
+            // the three cards beside it. A 10px bar where the others have a
+            // 46px chart left this card's last line floating a finger's width
+            // above theirs, which is the kind of near-miss that makes a row of
+            // cards look accidental.
             None => {
-                chrome::meter(ui, fraction, color, Some(caption));
+                let trend_height = ui.available_height().clamp(30.0, 46.0);
+                let before = ui.cursor().top();
+                chrome::meter(ui, fraction, color, None);
+                let used = ui.cursor().top() - before;
+                ui.add_space((trend_height - used).max(0.0));
+                ui.add_space(theme::GAP_TIGHT);
+                ui.add(Label::new(RichText::new(caption).small().color(MUTED)).truncate());
             }
         }
     });
@@ -7125,6 +8056,95 @@ fn metric_widget(
         ui.add_space(theme::GAP_TIGHT);
         ui.add(Label::new(RichText::new(detail).small().color(MUTED)).wrap());
     });
+}
+
+/// One ranked finding on the Diagnose report, whatever produced it.
+///
+/// The machine checks and the health assessment both name things that are
+/// wrong, and the page used to print them as two lists with no way to tell
+/// which mattered more. Ranking them against each other needs one shape, and
+/// `source` keeps the provenance visible rather than blending them into an
+/// anonymous list the user cannot verify.
+struct Finding {
+    severity: health::Severity,
+    title: String,
+    detail: String,
+    source: &'static str,
+}
+
+/// A sidebar entry that owns sub-entries. Named rather than passed as four
+/// booleans so that opening one and closing the rest is a single statement
+/// that cannot be half-written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavGroup {
+    Hardware,
+    Storage,
+    Security,
+    Tools,
+}
+
+/// The colour a check's verdict is drawn in, wherever it is drawn.
+///
+/// Not `Severity::color`, because the severity vocabulary has no word for "the
+/// check itself failed". It maps `Error` to `None` along with `Skipped`, on
+/// the reasoning that neither is a statement about the machine -- which is
+/// true, and which left a check that blew up looking exactly like one that was
+/// never meant to run. A check that could not complete is a failure of the
+/// diagnosis and is drawn red, so a sweep with a hole in it cannot be mistaken
+/// for a clean one.
+///
+/// `Skipped` stays grey. That one really is "nothing to say here": a Windows
+/// check on a machine that has no such feature has not failed at anything.
+fn check_color(ui: &Ui, status: diagnose::CheckStatus) -> Color32 {
+    match status {
+        diagnose::CheckStatus::Pass => theme::good(ui),
+        diagnose::CheckStatus::Warning | diagnose::CheckStatus::NeedsAdmin => theme::warn(ui),
+        diagnose::CheckStatus::Problem | diagnose::CheckStatus::Error => theme::bad(ui),
+        diagnose::CheckStatus::Skipped => MUTED,
+    }
+}
+
+/// One figure under a short label, for the row of counts on the report.
+///
+/// Not `metric_widget`: that draws a card, and four cards inside the callout
+/// would be four borders inside a border. Here the callout is the container
+/// and the figures are its contents.
+fn stat(ui: &mut Ui, label: &str, value: &str, color: Color32) {
+    ui.vertical(|ui| {
+        ui.add(
+            Label::new(
+                RichText::new(label)
+                    .font(theme::eyebrow())
+                    .color(theme::muted(ui)),
+            )
+            .truncate(),
+        );
+        ui.label(
+            RichText::new(value)
+                .font(theme::readout_large())
+                .color(color),
+        );
+    });
+}
+
+/// How long a check took, written the way a stopwatch would read it.
+///
+/// Sub-second checks still get a figure rather than a rounded `0 s`: three of
+/// the nine are registry reads that genuinely finish in milliseconds, and a
+/// column of zeroes reads as a column of failures.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f32();
+    if seconds < 1.0 {
+        format!("{} ms", elapsed.as_millis())
+    } else if seconds < 60.0 {
+        format!("{seconds:.1} s")
+    } else {
+        format!(
+            "{} min {:02} s",
+            elapsed.as_secs() / 60,
+            elapsed.as_secs() % 60
+        )
+    }
 }
 
 /// A secondary button. Ghost weight takes its colours from the widget visuals,

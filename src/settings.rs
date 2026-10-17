@@ -66,6 +66,18 @@ pub struct Settings {
     pub first_run_baseline_completed: bool,
     /// Last completed health score, retained while the next silent check runs.
     pub last_health_score: Option<u8>,
+    /// The score before the current one, so the ring can say which way the
+    /// machine is going. A figure with nothing to compare against says only
+    /// half of what it knows.
+    pub prior_health_score: Option<u8>,
+    /// Unix seconds when that score was measured, so a launch can tell a
+    /// fresh cache from a stale one instead of re-running the checks.
+    pub last_health_checked: Option<u64>,
+    /// When the silent background probe last ran. Separate from
+    /// `last_health_checked`, which belongs to the diagnostic the user ran:
+    /// the probe keeps the score from going stale, it does not count as
+    /// having checked the machine.
+    pub last_probe_at: Option<u64>,
 }
 
 impl Default for Settings {
@@ -79,6 +91,9 @@ impl Default for Settings {
             last_backup_dir: None,
             first_run_baseline_completed: false,
             last_health_score: None,
+            prior_health_score: None,
+            last_health_checked: None,
+            last_probe_at: None,
         }
     }
 }
@@ -129,6 +144,15 @@ impl Settings {
                 }
                 "first_run_baseline_completed" => {
                     settings.first_run_baseline_completed = value == "true";
+                }
+                "prior_health_score" => {
+                    settings.prior_health_score = value.parse::<u8>().ok().filter(|s| *s <= 100);
+                }
+                "last_probe_at" => {
+                    settings.last_probe_at = value.parse::<u64>().ok();
+                }
+                "last_health_checked" => {
+                    settings.last_health_checked = value.parse::<u64>().ok();
                 }
                 "last_health_score" => {
                     settings.last_health_score = value.parse::<u8>().ok().filter(|s| *s <= 100);
@@ -200,6 +224,20 @@ impl Settings {
             self.first_run_baseline_completed
         ));
         out.push_str(&format!(
+            "prior_health_score = {}\n",
+            self.prior_health_score
+                .map(|score| score.to_string())
+                .unwrap_or_default()
+        ));
+        out.push_str(&format!(
+            "last_probe_at = {}\n",
+            self.last_probe_at.unwrap_or_default()
+        ));
+        out.push_str(&format!(
+            "last_health_checked = {}\n",
+            self.last_health_checked.unwrap_or_default()
+        ));
+        out.push_str(&format!(
             "last_health_score = {}\n",
             self.last_health_score
                 .map(|score| score.to_string())
@@ -241,6 +279,9 @@ mod tests {
             last_backup_dir: Some(PathBuf::from(r"D:\backups")),
             first_run_baseline_completed: true,
             last_health_score: Some(88),
+            last_health_checked: Some(1_700_000_000),
+            last_probe_at: Some(1_700_000_000),
+            prior_health_score: Some(80),
         };
         let parsed = Settings::parse(&original.serialize());
         assert_eq!(parsed, original);

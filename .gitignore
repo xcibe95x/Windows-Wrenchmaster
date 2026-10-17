@@ -1,3 +1,10 @@
 /target
 /sensor-helper/bin/
 /sensor-helper/obj/
+
+# Agent skills installed per-project by `npx skills add`. Local tooling, not
+# part of the build: they land here because the installer targets the project
+# root, and they would otherwise show up as untracked noise on every commit.
+/.agents/
+/.claude/
+/skills-lock.json

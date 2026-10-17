@@ -15,6 +15,8 @@
 use std::process::Command;
 use std::time::Duration;
 
+use crate::util::{human_duration, plural};
+
 #[derive(Clone, Debug)]
 pub struct EventFinding {
     pub source: String,
@@ -209,8 +211,17 @@ fn decode_base64_utf8(value: &str) -> String {
 pub enum CheckId {
     Uptime,
     PendingReboot,
+    PowerPlan,
+    MemoryPressure,
+    StartupLoad,
+    StorageSpace,
+    SearchIndexScope,
+    PageFile,
+    WindowsUpdate,
     EventLog,
+    CrashDumps,
     DeviceProblems,
+    DriverAge,
     SecurityPosture,
     MemoryDiagnostic,
     DiskHealth,
@@ -224,11 +235,20 @@ impl CheckId {
     /// Cheap and always-available checks come first on purpose. DISM is last
     /// because it is the one that can plausibly take a minute, and a checklist
     /// that sits empty for a minute before anything appears reads as a hang.
-    pub const ALL: [CheckId; 9] = [
+    pub const ALL: [CheckId; 18] = [
         CheckId::Uptime,
         CheckId::PendingReboot,
+        CheckId::PowerPlan,
+        CheckId::MemoryPressure,
+        CheckId::StartupLoad,
+        CheckId::StorageSpace,
+        CheckId::SearchIndexScope,
+        CheckId::PageFile,
+        CheckId::WindowsUpdate,
         CheckId::EventLog,
+        CheckId::CrashDumps,
         CheckId::DeviceProblems,
+        CheckId::DriverAge,
         CheckId::SecurityPosture,
         CheckId::MemoryDiagnostic,
         CheckId::DiskHealth,
@@ -241,6 +261,15 @@ impl CheckId {
         match self {
             CheckId::Uptime => "Uptime",
             CheckId::PendingReboot => "Pending restart",
+            CheckId::PowerPlan => "Power plan",
+            CheckId::MemoryPressure => "Memory pressure",
+            CheckId::DriverAge => "Driver age",
+            CheckId::StartupLoad => "Startup programs",
+            CheckId::StorageSpace => "Free disk space",
+            CheckId::SearchIndexScope => "Search index scope",
+            CheckId::PageFile => "Virtual memory",
+            CheckId::WindowsUpdate => "Windows update age",
+            CheckId::CrashDumps => "Recent crashes",
             CheckId::EventLog => "Windows event log",
             CheckId::DeviceProblems => "Device problems",
             CheckId::SecurityPosture => "Virus protection",
@@ -261,6 +290,33 @@ impl CheckId {
             }
             CheckId::PendingReboot => {
                 "Whether Windows has already staged an update or a file rename that only takes effect after a restart."
+            }
+            CheckId::PowerPlan => {
+                "Which Windows power plan is active. Power saver caps the processor, and a laptop on battery does the same thing again on top of it."
+            }
+            CheckId::MemoryPressure => {
+                "How close memory is to its commit limit, and whether Windows is fetching pages back from disk. This is what a machine that feels slow with a quiet processor usually turns out to be doing."
+            }
+            CheckId::DriverAge => {
+                "How old the third-party drivers are for the devices that cause stutter when their driver misbehaves: network, audio, storage and display."
+            }
+            CheckId::StartupLoad => {
+                "How many programs Windows launches with you. Each one costs boot time and memory for as long as the session lasts."
+            }
+            CheckId::StorageSpace => {
+                "Free space on every fixed drive. Below a few percent Windows cannot grow the page file or write an update, and everything slows at once."
+            }
+            CheckId::SearchIndexScope => {
+                "Which drives Windows Search indexes. A spinning drive in the index is woken and kept spinning by a background crawl the user never asked for."
+            }
+            CheckId::PageFile => {
+                "Whether a page file exists and how large it is. A disabled page file turns a memory spike into a closed program or a stop error."
+            }
+            CheckId::WindowsUpdate => {
+                "When an update was last installed. Months of silence usually means updates are failing rather than that none were offered."
+            }
+            CheckId::CrashDumps => {
+                "Stop errors -- blue screens -- recorded in the last 30 days, from both the crash dump folder and the bugcheck event."
             }
             CheckId::EventLog => {
                 "Critical and Error entries recorded by the System and Application logs in the last 24 hours."
@@ -283,6 +339,66 @@ impl CheckId {
             CheckId::SystemFiles => {
                 "Whether DISM reports corruption in the Windows component store. Read-only: this does not repair anything."
             }
+        }
+    }
+
+    /// Whether this check belongs to the silent health probe at startup.
+    ///
+    /// Six cheap reads that between them decide most of the score: how full
+    /// the Windows drive is, how close memory is to its limit, whether
+    /// Windows logged anything serious, whether a device is faulted, whether
+    /// a restart is pending, and how long the machine has been up. Everything
+    /// slower or narrower belongs to the diagnostic the user asks for.
+    pub fn in_health_probe(self) -> bool {
+        matches!(
+            self,
+            CheckId::Uptime
+                | CheckId::PendingReboot
+                | CheckId::StorageSpace
+                | CheckId::MemoryPressure
+                | CheckId::EventLog
+                | CheckId::DeviceProblems
+        )
+    }
+
+    /// The Windows tool that answers this check in more depth, as a button
+    /// label and a shell target.
+    ///
+    /// Only read-only consoles and Settings pages are listed. A check that has
+    /// no honest counterpart returns `None` rather than the nearest thing:
+    /// uptime is answered by restarting, and the component store is repaired
+    /// by DISM, and offering either from a page whose whole promise is that it
+    /// only reads would be the page breaking its own rule. Those live on the
+    /// Repair tab, behind its confirmation, where they belong.
+    pub fn tool(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            CheckId::PendingReboot | CheckId::WindowsUpdate => {
+                Some(("Open Windows Update", "ms-settings:windowsupdate"))
+            }
+            CheckId::PowerPlan => Some(("Open Power options", "ms-settings:powersleep")),
+            CheckId::StartupLoad => Some(("Open Startup apps", "ms-settings:startupapps")),
+            CheckId::MemoryPressure => Some(("Open Resource Monitor", "resmon.exe")),
+            CheckId::DriverAge => Some(("Open Device Manager", "devmgmt.msc")),
+            CheckId::StorageSpace => Some(("Open Storage settings", "ms-settings:storagesense")),
+            CheckId::SearchIndexScope => {
+                Some(("Open Search settings", "ms-settings:cortana-windowssearch"))
+            }
+            CheckId::PageFile => Some((
+                "Open Performance options",
+                "SystemPropertiesPerformance.exe",
+            )),
+            // Reliability Monitor would be the friendlier window, but it is
+            // `perfmon /rel` and the shell launcher takes a single token --
+            // quoting the switch into it opens nothing at all.
+            CheckId::CrashDumps => Some(("Open Event Viewer", "eventvwr.msc")),
+            CheckId::EventLog => Some(("Open Event Viewer", "eventvwr.msc")),
+            CheckId::DeviceProblems => Some(("Open Device Manager", "devmgmt.msc")),
+            CheckId::SecurityPosture => Some(("Open Windows Security", "windowsdefender:")),
+            CheckId::MemoryDiagnostic => Some(("Open Memory Diagnostic", "mdsched.exe")),
+            CheckId::DiskHealth | CheckId::VolumeDirtyBit => {
+                Some(("Open Disk Management", "diskmgmt.msc"))
+            }
+            CheckId::Uptime | CheckId::SystemFiles => None,
         }
     }
 }
@@ -311,17 +427,19 @@ impl CheckStatus {
         }
     }
 
-    /// Map onto the Overview's severity vocabulary so a colour means the same
-    /// thing on both pages. `None` is deliberate for the two statuses that are
-    /// not findings at all: a check that did not run has nothing to say about
-    /// the machine, and painting it green or amber would claim it does.
-    pub fn severity(self) -> Option<crate::health::Severity> {
-        match self {
-            CheckStatus::Pass => Some(crate::health::Severity::Info),
-            CheckStatus::Warning | CheckStatus::NeedsAdmin => Some(crate::health::Severity::Warn),
-            CheckStatus::Problem => Some(crate::health::Severity::Bad),
-            CheckStatus::Skipped | CheckStatus::Error => None,
-        }
+    /// Whether this verdict is something the user has to act on.
+    ///
+    /// The old `severity()` that mapped onto the Overview's vocabulary is
+    /// gone: it had to return `None` for a check that could not run, which is
+    /// how a check that blew up ended up painted the same grey as one that was
+    /// never meant to apply. Colour now comes from `check_color` in the app,
+    /// which has a word for that case; what remains here is the one question
+    /// the module itself can answer.
+    pub fn is_finding(self) -> bool {
+        matches!(
+            self,
+            CheckStatus::Warning | CheckStatus::NeedsAdmin | CheckStatus::Problem
+        )
     }
 }
 
@@ -338,6 +456,15 @@ pub struct CheckOutcome {
     pub details: Vec<String>,
 }
 
+/// How much of the suite to run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// Everything. The diagnostic the user asked for.
+    Full,
+    /// The six the score leans on, for the silent startup pass.
+    HealthProbe,
+}
+
 /// Progress from the scan worker.
 ///
 /// `Started` and `Finished` exist so the checklist can show which check is
@@ -350,7 +477,8 @@ pub enum CheckMessage {
     /// because the page still draws the per-event list and the Overview still
     /// scores on the finding count.
     Events(ScanResult),
-    Finished(CheckOutcome),
+    /// The verdict, and how long that check took on the worker thread.
+    Finished(CheckOutcome, Duration),
     AllDone,
 }
 
@@ -359,17 +487,32 @@ pub enum CheckMessage {
 /// One thread rather than one per check: these mostly shell out to PowerShell,
 /// and nine simultaneous `powershell.exe` processes cost more than the scan
 /// saves on a machine that is already being diagnosed for being slow.
-pub fn start_system_scan() -> std::sync::mpsc::Receiver<CheckMessage> {
+pub fn start_system_scan(scope: Scope) -> std::sync::mpsc::Receiver<CheckMessage> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for id in CheckId::ALL {
+            let wanted = match scope {
+                Scope::Full => true,
+                Scope::HealthProbe => id.in_health_probe(),
+            };
+            if !wanted {
+                continue;
+            }
             // A closed receiver means the window went away. Stop rather than
             // keep spawning child processes nobody will read the output of.
             if sender.send(CheckMessage::Started(id)).is_err() {
                 return;
             }
+            // Timed here rather than on the UI thread. The window drains this
+            // channel on a 200ms poll and can take a whole batch in one frame,
+            // so a clock read at the receiving end measures when the message
+            // was collected, not how long the check ran.
+            let started = std::time::Instant::now();
             let outcome = run_check(id, &sender);
-            if sender.send(CheckMessage::Finished(outcome)).is_err() {
+            if sender
+                .send(CheckMessage::Finished(outcome, started.elapsed()))
+                .is_err()
+            {
                 return;
             }
         }
@@ -401,6 +544,15 @@ fn run_check(id: CheckId, sender: &std::sync::mpsc::Sender<CheckMessage>) -> Che
             }
             CheckId::Uptime => check_uptime(),
             CheckId::PendingReboot => check_pending_reboot(),
+            CheckId::PowerPlan => check_power_plan(),
+            CheckId::MemoryPressure => check_memory_pressure(),
+            CheckId::DriverAge => check_driver_age(),
+            CheckId::StartupLoad => check_startup_load(),
+            CheckId::StorageSpace => check_storage_space(),
+            CheckId::SearchIndexScope => check_search_index_scope(),
+            CheckId::PageFile => check_page_file(),
+            CheckId::WindowsUpdate => check_windows_update(),
+            CheckId::CrashDumps => check_crash_dumps(),
             CheckId::DeviceProblems => check_device_problems(),
             CheckId::SecurityPosture => check_security_posture(),
             CheckId::MemoryDiagnostic => check_memory_diagnostic(),
@@ -462,7 +614,10 @@ fn summarise_events(result: &ScanResult) -> CheckOutcome {
             } else {
                 CheckStatus::Warning
             },
-            summary: format!("{count} Critical or Error event(s) in the last 24 hours."),
+            summary: format!(
+                "{} in the last 24 hours.",
+                plural(count, "Critical or Error event")
+            ),
             details,
         },
     }
@@ -985,7 +1140,10 @@ try {
         return failed(id, format!("Could not read the last boot time: {detail}"));
     };
     let days = hours / 24.0;
-    let details = vec![format!("Last started {boot} ({hours:.1} hours ago)")];
+    let details = vec![format!(
+        "Last started {boot} ({} ago)",
+        human_duration(hours)
+    )];
     // The same two bands health.rs uses for uptime, for the same reason the
     // disk thresholds were unified: one judgement, one pair of numbers.
     if days >= 7.0 {
@@ -993,7 +1151,8 @@ try {
             id,
             status: CheckStatus::Warning,
             summary: format!(
-                "Up for {days:.0} days. A restart would apply anything Windows has staged."
+                "Up for {}. A restart would apply anything Windows has staged.",
+                human_duration(hours)
             ),
             details,
         }
@@ -1001,7 +1160,7 @@ try {
         CheckOutcome {
             id,
             status: CheckStatus::Pass,
-            summary: format!("Up for {days:.1} days."),
+            summary: format!("Up for {}.", human_duration(hours)),
             details,
         }
     }
@@ -1070,7 +1229,7 @@ fn check_pending_reboot() -> CheckOutcome {
         CheckOutcome {
             id,
             status: CheckStatus::Warning,
-            summary: format!("{} restart marker(s) are set.", reasons.len()),
+            summary: format!("{} set.", plural(reasons.len(), "restart marker")),
             details,
         }
     }
@@ -1124,7 +1283,7 @@ try {
     CheckOutcome {
         id,
         status: CheckStatus::Warning,
-        summary: format!("{} device(s) are reporting an error.", devices.len()),
+        summary: format!("{} reporting an error.", plural(devices.len(), "device")),
         details,
     }
 }
@@ -1179,7 +1338,8 @@ try {
         ),
         match status.signature_age_days {
             Some(age) => format!(
-                "Signatures are {age} day(s) old, last updated {}",
+                "Signatures are {} old, last updated {}",
+                plural(age as usize, "day"),
                 if status.signature_updated.is_empty() {
                     "at an unreported time"
                 } else {
@@ -1279,10 +1439,7 @@ try {
         CheckOutcome {
             id,
             status: CheckStatus::Pass,
-            summary: format!(
-                "{} past memory diagnostic run(s), none failed.",
-                events.len()
-            ),
+            summary: format!("{}, none failed.", events.len()),
             details,
         }
     }
@@ -1382,7 +1539,10 @@ try {
             line.push_str(&format!(" · {hours} h powered"));
         }
         if let Some(read_errors) = disk.uncorrected_read_errors {
-            line.push_str(&format!(" · {read_errors} uncorrected read error(s)"));
+            line.push_str(&format!(
+                " · {}",
+                plural(read_errors as usize, "uncorrected read error")
+            ));
         }
         details.push(truncate(&line, 300));
 
@@ -1416,15 +1576,18 @@ try {
     }
     details.extend(errors);
     let summary = if unhealthy == 0 && status == CheckStatus::Pass {
-        format!("{} drive(s) report themselves healthy.", disks.len())
+        format!(
+            "{} report themselves healthy.",
+            plural(disks.len(), "drive")
+        )
     } else if unhealthy == 0 {
         format!(
-            "{} drive(s) report healthy, but the wear or error counters are worth a look.",
+            "{} report healthy, but the wear or error counters are worth a look.",
             disks.len()
         )
     } else {
         format!(
-            "{unhealthy} of {} drive(s) are not reporting a healthy state.",
+            "{unhealthy} of {} not reporting a healthy state.",
             disks.len()
         )
     };
@@ -1434,6 +1597,1073 @@ try {
         summary,
         details,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The facets a slow or unstable machine usually turns out to be hiding in.
+//
+// These were added because the first nine answered "is Windows damaged" well
+// and "why is this machine unpleasant to use" not at all. A capped processor,
+// forty startup programs, a drive with 2 GB left, no page file, a year of
+// failed updates and a weekly stop error are all common, all cheap to read,
+// and none of them show up in a component-store scan.
+// ---------------------------------------------------------------------------
+
+/// Which power plan is active, and whether the machine is on battery.
+///
+/// Power saver on a desktop is nearly always an accident -- an OEM tool or a
+/// game launcher set it and nothing set it back -- and it caps the processor
+/// hard enough to be the whole complaint on its own.
+#[cfg(windows)]
+fn check_power_plan() -> CheckOutcome {
+    let id = CheckId::PowerPlan;
+    // `powercfg`, not `Win32_PowerPlan`. The CIM class lives in
+    // root\cimv2\power and reading it unelevated fails outright -- the UAT on
+    // an ordinary session got "only administrators have permission", which
+    // would have put a "Could not check" row on this page for every user who
+    // runs the app the way it is meant to be run. `powercfg
+    // /getactivescheme` answers the same question with no token at all.
+    const BODY: &str = r#"
+try {
+  $active = (& powercfg.exe /getactivescheme 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or -not $active) { throw 'powercfg did not report an active scheme.' }
+  $battery = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+  $onBattery = $false
+  if ($battery.Count -gt 0) { $onBattery = ($battery[0].BatteryStatus -eq 1) }
+  Emit 'PLAN' @($active, [string]$onBattery, [string]($battery.Count -gt 0))
+  Emit 'PLANOK' @('1')
+} catch { Emit 'PLANERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(30)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "PLANERR");
+    if !report_completed(&output.stdout, "PLANOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not read the power plan: {detail}"));
+    }
+    let Some(fields) = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .find(|(key, _)| *key == "PLAN")
+        .map(|(_, fields)| fields)
+    else {
+        return failed(id, "Windows named no active power plan.".to_owned());
+    };
+    let reported = field(&fields, 0);
+    let on_battery = field(&fields, 1).eq_ignore_ascii_case("true");
+    let has_battery = field(&fields, 2).eq_ignore_ascii_case("true");
+    let (guid, name) = parse_active_scheme(reported);
+    // By GUID, never by name. `powercfg` prints the scheme name in the
+    // display language -- this was first written to match on "saver" and the
+    // machine it was tested on answered in Italian, which is the whole
+    // argument against matching on words.
+    let saver = guid.eq_ignore_ascii_case(POWER_SAVER_GUID);
+
+    let mut details = vec![format!("Active plan: {}", truncate(&name, 120))];
+    if has_battery {
+        details.push(
+            if on_battery {
+                "Running on battery, where Windows applies its own additional limits."
+            } else {
+                "Plugged in."
+            }
+            .to_owned(),
+        );
+    }
+    details.extend(errors);
+
+    // Balanced is not reported as a finding. It is the Windows default, it
+    // boosts on demand, and calling it a problem would make this check cry
+    // wolf on the majority of healthy machines.
+    let (status, summary) = if saver {
+        (
+            CheckStatus::Warning,
+            format!(
+                "Power saver is active ({}). The processor is capped.",
+                truncate(&name, 60)
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            format!("{} is active.", truncate(&name, 80)),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// What Windows launches at sign-in.
+///
+/// Counted from `Win32_StartupCommand`, which covers the Run keys and the
+/// Startup folders. It does not cover scheduled tasks or services, so the
+/// summary says "programs" rather than claiming to be the whole boot cost.
+#[cfg(windows)]
+fn check_startup_load() -> CheckOutcome {
+    let id = CheckId::StartupLoad;
+    const BODY: &str = r#"
+try {
+  $items = @(Get-CimInstance -ClassName Win32_StartupCommand -ErrorAction Stop)
+  foreach ($item in $items) { Emit 'RUN' @($item.Name, $item.Location, $item.Command) }
+  Emit 'RUNOK' @([string]$items.Count)
+} catch { Emit 'RUNERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(45)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "RUNERR");
+    if !report_completed(&output.stdout, "RUNOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not list startup programs: {detail}"));
+    }
+    let entries: Vec<(String, String)> = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .filter(|(key, _)| *key == "RUN")
+        .map(|(_, fields)| {
+            (
+                truncate(field(&fields, 0), 70),
+                truncate(field(&fields, 2), 120),
+            )
+        })
+        .collect();
+
+    let mut details: Vec<String> = entries
+        .iter()
+        .take(20)
+        .map(|(name, command)| format!("{name} · {command}"))
+        .collect();
+    details.extend(errors);
+
+    // Twelve is where this starts being worth saying. A clean Windows install
+    // with a vendor audio panel and a cloud drive lands around five; past a
+    // dozen the sign-in is visibly slower, and the list is long enough that
+    // the user has stopped noticing what is in it.
+    let (status, summary) = match entries.len() {
+        0 => (
+            CheckStatus::Pass,
+            "Nothing starts with Windows beyond the system's own services.".to_owned(),
+        ),
+        count if count <= 12 => (
+            CheckStatus::Pass,
+            format!("{} start with Windows.", plural(count, "program")),
+        ),
+        count => (
+            CheckStatus::Warning,
+            format!(
+                "{} start with Windows, which is enough to slow the sign-in.",
+                plural(count, "program")
+            ),
+        ),
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// Free space on every fixed drive.
+///
+/// Both a percentage and an absolute floor, because neither alone is right:
+/// 5% of a 4 TB drive is 200 GB and fine, while 5 GB free on any drive is not,
+/// and 10% of a 128 GB laptop drive is already too tight for a feature update.
+#[cfg(windows)]
+fn check_storage_space() -> CheckOutcome {
+    let id = CheckId::StorageSpace;
+    const BODY: &str = r#"
+try {
+  $system = ($env:SystemDrive).TrimEnd(':')
+  $media = @{}
+  try {
+    foreach ($disk in @(Get-PhysicalDisk -ErrorAction Stop)) {
+      foreach ($part in @(Get-Partition -DiskNumber $disk.DeviceId -ErrorAction SilentlyContinue)) {
+        if ($part.DriveLetter) { $media[[string]$part.DriveLetter] = [string]$disk.MediaType }
+      }
+    }
+  } catch { }
+  $volumes = @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveType -eq 'Fixed' -and $_.Size -gt 0 })
+  foreach ($volume in $volumes) {
+    $letter = [string]$volume.DriveLetter
+    $kind = ''
+    if ($letter -and $media.ContainsKey($letter)) { $kind = $media[$letter] }
+    Emit 'VOL' @($volume.DriveLetter, $volume.FileSystemLabel, [string]$volume.Size, [string]$volume.SizeRemaining, [string]($letter -eq $system), $kind)
+  }
+  Emit 'VOLOK' @([string]$volumes.Count)
+} catch { Emit 'VOLERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(45)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "VOLERR");
+    if !report_completed(&output.stdout, "VOLOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not read drive free space: {detail}"));
+    }
+
+    // Two scales, because one alone is wrong in both directions. The UAT
+    // machine has 130 GB free on a 2 TB drive -- 6.5%, which a percentage
+    // rule calls low and which is in fact plenty -- and a 974 MB recovery
+    // partition, which an absolute rule calls critical on every machine ever
+    // made. So a drive is only short of space when it is short by both, and
+    // the floors are set where Windows itself starts to struggle: a feature
+    // update wants about 20 GB, and under 5 GB the page file cannot grow.
+    const CRITICAL_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+    const TIGHT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+    // A second drive with nothing left on it is a storage problem, not a
+    // performance one. Windows pages, updates, writes its temp files and
+    // builds its search index on the system drive; a full games or archive
+    // drive inconveniences the user and slows nothing. Saying otherwise
+    // teaches people to ignore this row, which costs them the one case --
+    // the system drive -- where it is urgent. So the floors are only applied
+    // in full to the system volume, and a secondary one has to be genuinely
+    // out of room before it is mentioned at all.
+    // Where Windows itself stops calling a drive comfortable: Explorer turns
+    // the capacity bar red at 90% used, and a solid-state drive wants about
+    // this much free to keep garbage collection ahead of writes.
+    const SYSTEM_HEADROOM_FRACTION: f64 = 0.10;
+    // The band above "out of headroom", where it is worth saying but not
+    // worth acting on yet.
+    const TIGHT_FRACTION: f64 = 0.20;
+    const SECONDARY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const SECONDARY_FRACTION: f64 = 0.01;
+
+    let mut status = CheckStatus::Pass;
+    let mut details = Vec::new();
+    let mut tight = Vec::new();
+    let mut full_secondary = Vec::new();
+    let mut counted = 0usize;
+    for (_, fields) in output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .filter(|(key, _)| *key == "VOL")
+    {
+        let letter = field(&fields, 0);
+        let label = field(&fields, 1);
+        // No drive letter means a recovery or EFI partition: small, always
+        // nearly full by design, and nothing the user can or should clear.
+        if letter.is_empty() {
+            continue;
+        }
+        let Ok(size) = field(&fields, 2).parse::<u64>() else {
+            continue;
+        };
+        let Ok(free) = field(&fields, 3).parse::<u64>() else {
+            continue;
+        };
+        if size == 0 {
+            continue;
+        }
+        counted += 1;
+        let fraction = free as f64 / size as f64;
+        let is_system = field(&fields, 4).eq_ignore_ascii_case("true");
+        let media = field(&fields, 5);
+        let name = if label.is_empty() {
+            format!("{letter}:")
+        } else {
+            format!("{letter}: {}", truncate(label, 30))
+        };
+        let kind = match media.to_ascii_uppercase().as_str() {
+            "HDD" => " · spinning disk",
+            "SSD" => " · SSD",
+            _ => "",
+        };
+        details.push(format!(
+            "{name}{}{kind} · {} free of {} ({:.0}%)",
+            if is_system { " · Windows drive" } else { "" },
+            crate::util::human_bytes(free),
+            crate::util::human_bytes(size),
+            fraction * 100.0
+        ));
+        if is_system {
+            // Proportion and gigabytes are different questions: bytes say
+            // whether an update can stage, percentage whether the drive can
+            // still manage its own writes. Past 90% full the Windows drive
+            // fails the second one, and that is a problem, not a note --
+            // Explorer turns its own bar red at the same point.
+            if fraction < SYSTEM_HEADROOM_FRACTION || free < CRITICAL_BYTES {
+                status = worse(status, CheckStatus::Problem);
+                tight.push(format!("{name} (Windows)"));
+            } else if fraction < TIGHT_FRACTION || free < TIGHT_BYTES {
+                status = worse(status, CheckStatus::Warning);
+                tight.push(format!("{name} (Windows)"));
+            }
+        } else if fraction < SECONDARY_FRACTION || free < SECONDARY_BYTES {
+            status = worse(status, CheckStatus::Warning);
+            full_secondary.push(name);
+        }
+    }
+    details.extend(errors);
+
+    if counted == 0 {
+        return CheckOutcome {
+            id,
+            status: CheckStatus::Error,
+            summary: "No lettered fixed drive reported its size.".to_owned(),
+            details,
+        };
+    }
+    let summary = match (tight.is_empty(), full_secondary.is_empty()) {
+        (true, true) => format!("All {} have room to work.", plural(counted, "fixed drive")),
+        (false, _) => format!(
+            "Little room left on {}, which is where Windows pages, updates and              manages its own writes.",
+            tight.join(", ")
+        ),
+        // Said plainly, including the part that makes it not urgent. The
+        // alternative is a user clearing a games drive to fix a slowdown it
+        // was never causing.
+        (true, false) => format!(
+            "{} is out of room. It does not slow Windows, but nothing more can be written to it.",
+            full_secondary.join(", ")
+        ),
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// Whether a page file exists at all.
+///
+/// The check is deliberately about existence rather than size. "Disable the
+/// page file, you have 32 GB" is advice that circulates widely and turns a
+/// memory spike into a closed program or a stop error; Windows managing its
+/// own size is the normal, correct state and is reported as a pass.
+#[cfg(windows)]
+fn check_page_file() -> CheckOutcome {
+    let id = CheckId::PageFile;
+    const BODY: &str = r#"
+try {
+  $system = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+  $files = @(Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction SilentlyContinue)
+  foreach ($file in $files) { Emit 'PF' @($file.Name, [string]$file.AllocatedBaseSize, [string]$file.CurrentUsage, [string]$file.PeakUsage) }
+  Emit 'PFSYS' @([string]$system.AutomaticManagedPagefile, [string]$files.Count)
+  Emit 'PFOK' @('1')
+} catch { Emit 'PFERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(30)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "PFERR");
+    if !report_completed(&output.stdout, "PFOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(
+            id,
+            format!("Could not read the page file settings: {detail}"),
+        );
+    }
+    let lines: Vec<(String, Vec<String>)> = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .map(|(key, fields)| (key.to_owned(), fields))
+        .collect();
+    let automatic = lines
+        .iter()
+        .find(|(key, _)| key == "PFSYS")
+        .map(|(_, fields)| field(fields, 0).eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut details: Vec<String> = lines
+        .iter()
+        .filter(|(key, _)| key == "PF")
+        .map(|(_, fields)| {
+            format!(
+                "{} · {} MB allocated · peak use {} MB",
+                truncate(field(fields, 0), 80),
+                field(fields, 1),
+                field(fields, 3)
+            )
+        })
+        .collect();
+    let count = details.len();
+    if automatic {
+        details.push("Windows is managing the size itself.".to_owned());
+    }
+    details.extend(errors);
+
+    let (status, summary) = if count == 0 && !automatic {
+        (
+            CheckStatus::Warning,
+            "No page file is configured. A memory spike has nowhere to go.".to_owned(),
+        )
+    } else if count == 0 {
+        (
+            CheckStatus::Pass,
+            "Windows is managing the page file itself.".to_owned(),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            format!("{} configured.", plural(count, "page file")),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// How long since an update actually installed.
+///
+/// Read from the installed-update history rather than from the update service,
+/// because the question is whether updates are landing, not whether the
+/// service says it is willing to look. `Get-HotFix` misses the updates that
+/// arrive as a component servicing operation, so a long gap is reported as
+/// something to look at rather than as a failure.
+#[cfg(windows)]
+fn check_windows_update() -> CheckOutcome {
+    let id = CheckId::WindowsUpdate;
+    const BODY: &str = r#"
+try {
+  $hotfixes = @(Get-HotFix -ErrorAction Stop | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending)
+  foreach ($fix in ($hotfixes | Select-Object -First 5)) {
+    Emit 'FIX' @($fix.HotFixID, $fix.Description, $fix.InstalledOn.ToString('yyyy-MM-dd'), [string]([math]::Floor(((Get-Date) - $fix.InstalledOn).TotalDays)))
+  }
+  Emit 'FIXOK' @([string]$hotfixes.Count)
+} catch { Emit 'FIXERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(60)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "FIXERR");
+    if !report_completed(&output.stdout, "FIXOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not read the update history: {detail}"));
+    }
+    let fixes: Vec<Vec<String>> = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .filter(|(key, _)| *key == "FIX")
+        .map(|(_, fields)| fields)
+        .collect();
+    let mut details: Vec<String> = fixes
+        .iter()
+        .map(|fields| {
+            format!(
+                "{} · {} · installed {}",
+                truncate(field(fields, 0), 30),
+                truncate(field(fields, 1), 40),
+                field(fields, 2)
+            )
+        })
+        .collect();
+    details.extend(errors);
+
+    let Some(age) = fixes
+        .first()
+        .and_then(|fields| field(fields, 3).parse::<i64>().ok())
+    else {
+        return CheckOutcome {
+            id,
+            status: CheckStatus::Skipped,
+            summary: "Windows reported no dated update history to read.".to_owned(),
+            details,
+        };
+    };
+
+    // Ninety days, not thirty. Monthly updates are the rhythm, but a machine
+    // that was off for a holiday is not a finding, and a check that warns
+    // every fifth week teaches the user to ignore it.
+    let (status, summary) = if age > 180 {
+        (
+            CheckStatus::Warning,
+            format!("The last update installed {age} days ago. Updates are probably failing."),
+        )
+    } else if age > 90 {
+        (
+            CheckStatus::Warning,
+            format!("The last update installed {age} days ago."),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            format!(
+                "An update installed {} ago.",
+                plural(age.max(0) as usize, "day")
+            ),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// Stop errors in the last 30 days, from the dump folder and the event.
+///
+/// Both sources, because either can be empty on a machine that is definitely
+/// crashing: dump writing can be turned off, and the bugcheck event is missed
+/// if the machine lost power rather than stopping. Agreement is not required
+/// -- whichever found something is reported.
+#[cfg(windows)]
+fn check_crash_dumps() -> CheckOutcome {
+    let id = CheckId::CrashDumps;
+    const BODY: &str = r#"
+try {
+  $since = (Get-Date).AddDays(-30)
+  $dumps = @()
+  $folder = Join-Path $env:SystemRoot 'Minidump'
+  if (Test-Path $folder) {
+    try {
+      $dumps = @(Get-ChildItem -Path $folder -Filter '*.dmp' -ErrorAction Stop | Where-Object { $_.LastWriteTime -ge $since } | Sort-Object LastWriteTime -Descending)
+    } catch { Emit 'DUMPDENIED' @($_.Exception.Message) }
+  }
+  foreach ($dump in ($dumps | Select-Object -First 10)) {
+    Emit 'DUMP' @($dump.Name, $dump.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), [string]([math]::Floor(((Get-Date) - $dump.LastWriteTime).TotalDays)))
+  }
+  $events = @()
+  try {
+    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -like '*BugCheck*' })
+  } catch { }
+  foreach ($event in ($events | Select-Object -First 10)) {
+    Emit 'BUG' @($event.TimeCreated.ToString('yyyy-MM-dd HH:mm'), [string]$event.Message)
+  }
+  Emit 'CRASHOK' @([string]$dumps.Count, [string]$events.Count)
+} catch { Emit 'CRASHERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(60)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "CRASHERR");
+    if !report_completed(&output.stdout, "CRASHOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not read the crash history: {detail}"));
+    }
+    let decoded: Vec<(String, Vec<String>)> = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .map(|(key, fields)| (key.to_owned(), fields))
+        .collect();
+    let dumps: Vec<&Vec<String>> = decoded
+        .iter()
+        .filter(|(key, _)| key == "DUMP")
+        .map(|(_, fields)| fields)
+        .collect();
+    let bugchecks: Vec<&Vec<String>> = decoded
+        .iter()
+        .filter(|(key, _)| key == "BUG")
+        .map(|(_, fields)| fields)
+        .collect();
+
+    let mut details: Vec<String> = dumps
+        .iter()
+        .map(|fields| {
+            format!(
+                "Crash dump {} · {}",
+                truncate(field(fields, 0), 40),
+                field(fields, 1)
+            )
+        })
+        .collect();
+    details.extend(bugchecks.iter().map(|fields| {
+        format!(
+            "Stop error logged {} · {}",
+            field(fields, 0),
+            truncate(field(fields, 1), 160)
+        )
+    }));
+    details.extend(errors);
+
+    let recent = dumps
+        .iter()
+        .filter_map(|fields| field(fields, 2).parse::<i64>().ok())
+        .min();
+    let count = dumps.len().max(bugchecks.len());
+    // Silence from a folder we were not allowed to open is not the same as
+    // silence from an empty one, and reporting "no crashes" on the strength
+    // of a permission error is the kind of false all-clear this page exists
+    // to avoid. The bugcheck events are still worth whatever they found.
+    let denied = decoded.iter().any(|(key, _)| key == "DUMPDENIED");
+    let (status, summary) = if count == 0 && denied {
+        (
+            CheckStatus::NeedsAdmin,
+            "The crash dump folder could not be read; only the event log was checked.".to_owned(),
+        )
+    } else if count == 0 {
+        (
+            CheckStatus::Pass,
+            "No stop error was recorded in the last 30 days.".to_owned(),
+        )
+    } else if recent.is_some_and(|days| days <= 7) {
+        (
+            CheckStatus::Problem,
+            format!(
+                "{} in the last 30 days, the most recent within a week.",
+                plural(count, "stop error")
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Warning,
+            format!("{} in the last 30 days.", plural(count, "stop error")),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// Which drives Windows Search crawls.
+///
+/// This is the read-only half of a real complaint: a spinning drive kept in
+/// the search index is woken by the crawler on its own schedule, so a machine
+/// that should be quiet clatters, and a drive the user touches once a month
+/// never gets to rest. On an SSD the same setting costs nothing noticeable,
+/// which is why the verdict turns on the media type rather than on the
+/// setting alone -- warning about an indexed SSD would be noise.
+///
+/// The scope comes from the crawl-scope registry rules rather than from the
+/// search WMI provider: `root\Microsoft\Windows\Search` does not exist on
+/// every edition -- the UAT machine answers "invalid namespace" -- while the
+/// rules under `CrawlScopeManager` are there whenever the feature is.
+///
+/// Nothing here changes a scope. Removing a drive from the index is a real
+/// change with a real cost (that drive stops appearing in Start menu results),
+/// so this names the drive and the setting, and the user decides.
+#[cfg(windows)]
+fn check_search_index_scope() -> CheckOutcome {
+    let id = CheckId::SearchIndexScope;
+    const BODY: &str = r#"
+try {
+  $system = ($env:SystemDrive).TrimEnd(':')
+  $service = 'Unknown'
+  $found = Get-Service WSearch -ErrorAction SilentlyContinue
+  if ($found) { $service = [string]$found.Status }
+  $media = @{}
+  try {
+    foreach ($disk in @(Get-PhysicalDisk -ErrorAction Stop)) {
+      foreach ($part in @(Get-Partition -DiskNumber $disk.DeviceId -ErrorAction SilentlyContinue)) {
+        if ($part.DriveLetter) { $media[[string]$part.DriveLetter] = [string]$disk.MediaType }
+      }
+    }
+  } catch { }
+  $counts = @{}
+  foreach ($set in @('WorkingSetRules', 'DefaultRules')) {
+    $base = 'HKLM:\SOFTWARE\Microsoft\Windows Search\CrawlScopeManager\Windows\SystemIndex\' + $set
+    foreach ($rule in @(Get-ChildItem $base -ErrorAction SilentlyContinue)) {
+      $values = Get-ItemProperty $rule.PSPath -ErrorAction SilentlyContinue
+      if (-not $values -or $values.Include -ne 1) { continue }
+      $match = [regex]::Match([string]$values.URL, '^file:///([A-Za-z]):')
+      if (-not $match.Success) { continue }
+      $letter = $match.Groups[1].Value.ToUpper()
+      if ($counts.ContainsKey($letter)) { $counts[$letter] = $counts[$letter] + 1 }
+      else { $counts[$letter] = 1 }
+    }
+  }
+  foreach ($letter in $counts.Keys) {
+    $kind = ''
+    if ($media.ContainsKey($letter)) { $kind = $media[$letter] }
+    Emit 'IDX' @($letter, $kind, [string]$counts[$letter], [string]($letter -eq $system.ToUpper()))
+  }
+  Emit 'IDXOK' @($service)
+} catch { Emit 'IDXERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(60)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "IDXERR");
+    if !report_completed(&output.stdout, "IDXOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(
+            id,
+            format!("Could not read the search index scope: {detail}"),
+        );
+    }
+    let decoded: Vec<(String, Vec<String>)> = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .map(|(key, fields)| (key.to_owned(), fields))
+        .collect();
+    let service = decoded
+        .iter()
+        .find(|(key, _)| key == "IDXOK")
+        .map(|(_, fields)| field(fields, 0).to_owned())
+        .unwrap_or_default();
+
+    let mut details = Vec::new();
+    let mut spinning = Vec::new();
+    let mut other_drives = 0usize;
+    for (_, fields) in decoded.iter().filter(|(key, _)| key == "IDX") {
+        let letter = field(fields, 0);
+        let media = field(fields, 1).to_ascii_uppercase();
+        let rules = field(fields, 2);
+        let is_system = field(fields, 3).eq_ignore_ascii_case("true");
+        let kind = match media.as_str() {
+            "HDD" => "spinning disk",
+            "SSD" => "SSD",
+            _ => "unknown drive type",
+        };
+        details.push(format!(
+            "{letter}: · {kind}{} · {} indexed",
+            if is_system { " · Windows drive" } else { "" },
+            plural(rules.parse().unwrap_or(0), "location")
+        ));
+        if is_system {
+            continue;
+        }
+        other_drives += 1;
+        if media == "HDD" {
+            spinning.push(letter.to_owned());
+        }
+    }
+    // Indexing the Windows drive is how search is meant to work and is not
+    // reported either way: the finding is only ever about the drives that did
+    // not have to be in there.
+    details.push(format!("Windows Search service: {service}."));
+    details.extend(errors);
+
+    let running = service.eq_ignore_ascii_case("Running");
+    let (status, summary) = if !running {
+        (
+            CheckStatus::Pass,
+            format!("Windows Search is not running ({service}); nothing is being crawled."),
+        )
+    } else if !spinning.is_empty() {
+        (
+            CheckStatus::Warning,
+            format!(
+                "{} is a spinning drive and is in the search index, so the crawler wakes it on its own schedule.",
+                spinning.join(", ")
+            ),
+        )
+    } else if other_drives > 0 {
+        (
+            CheckStatus::Pass,
+            format!(
+                "{} beyond Windows are indexed, none of them spinning.",
+                plural(other_drives, "drive")
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            "Only the Windows drive is indexed.".to_owned(),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// Memory pressure: how close the machine is to its commit limit, and whether
+/// it is reading pages back off the disk to stay there.
+///
+/// This is the gap the other checks left. A machine with 8 GB and a browser
+/// open has a quiet processor, a healthy drive, no device errors and nothing
+/// in the event log, and is still unpleasant to use, because every switch
+/// between windows is a trip to the page file. Nothing else here would see it.
+///
+/// Read through `Win32_PerfFormattedData_PerfOS_Memory` rather than
+/// `Get-Counter`. Counter *paths* are localised -- `\Memory\Available MBytes`
+/// does not resolve on a Windows installed in Italian, which is the machine
+/// this was written on -- while the CIM class name is the same everywhere.
+#[cfg(windows)]
+fn check_memory_pressure() -> CheckOutcome {
+    let id = CheckId::MemoryPressure;
+    // Three samples rather than one. Hard faults are spiky by nature and a
+    // single instant catches either a burst or a lull; a second and a half of
+    // them is still cheap and is at least an average of something.
+    const BODY: &str = r#"
+try {
+  $available = @(); $committed = @(); $faults = @()
+  foreach ($pass in 1..3) {
+    $memory = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+    $available += [double]$memory.AvailableMBytes
+    $committed += [double]$memory.PercentCommittedBytesInUse
+    $faults += [double]$memory.PagesInputPerSec
+    if ($pass -lt 3) { Start-Sleep -Milliseconds 500 }
+  }
+  Emit 'MEM' @(
+    [string]([math]::Round(($available | Measure-Object -Average).Average)),
+    [string]([math]::Round(($committed | Measure-Object -Average).Average)),
+    [string]([math]::Round(($faults | Measure-Object -Average).Average))
+  )
+  Emit 'MEMOK' @('1')
+} catch { Emit 'MEMERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(45)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "MEMERR");
+    if !report_completed(&output.stdout, "MEMOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not read the memory counters: {detail}"));
+    }
+    let Some(fields) = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .find(|(key, _)| *key == "MEM")
+        .map(|(_, fields)| fields)
+    else {
+        return failed(id, "The memory counters returned nothing.".to_owned());
+    };
+    let available = field(&fields, 0).parse::<f64>().unwrap_or(-1.0);
+    let committed = field(&fields, 1).parse::<f64>().unwrap_or(-1.0);
+    let faults = field(&fields, 2).parse::<f64>().unwrap_or(0.0);
+    if available < 0.0 || committed < 0.0 {
+        return failed(
+            id,
+            "The memory counters returned no usable figures.".to_owned(),
+        );
+    }
+
+    let mut details = vec![
+        format!("{available:.0} MB available to hand out without paging."),
+        format!("{committed:.0}% of the commit limit is in use."),
+        format!("{faults:.0} pages per second read back from disk, averaged over 1.5 seconds."),
+        "Taken at the moment of the scan. A machine that is only slow while a particular program \
+         runs will read normally here if that program is closed."
+            .to_owned(),
+    ];
+    details.extend(errors);
+
+    // 90% committed is where Windows starts refusing allocations outright and
+    // 512 MB available is where it is already paging to keep going. The
+    // warning band below each is deliberately wide: this check is a pointer
+    // at a cause, not a verdict, and a near-miss is worth saying.
+    let (status, summary) = if committed >= 95.0 || available < 512.0 {
+        (
+            CheckStatus::Problem,
+            format!(
+                "Memory is nearly exhausted: {committed:.0}% committed, {available:.0} MB free."
+            ),
+        )
+    } else if committed >= 85.0 || available < 1024.0 {
+        (
+            CheckStatus::Warning,
+            format!("Memory is tight: {committed:.0}% committed, {available:.0} MB free."),
+        )
+    } else if faults >= 200.0 {
+        (
+            CheckStatus::Warning,
+            format!(
+                "Memory is not full, but {faults:.0} pages a second are coming back from disk."
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Pass,
+            format!("{available:.0} MB available, {committed:.0}% of the commit limit in use."),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// How old the third-party drivers are on the devices that cause stutter.
+///
+/// Microsoft's own drivers are excluded, and this is the whole subtlety of the
+/// check: every in-box driver carries the date 21 June 2006 regardless of how
+/// current it is -- the UAT machine reports a 2006 date against version
+/// 10.0.26100, shipped this year. Judging those by date would flag every
+/// Windows installation in existence. A vendor driver's date is real.
+///
+/// Classes are limited to the four subsystems where an old driver is a
+/// plausible cause of the symptom rather than a tidiness complaint: network,
+/// audio, storage and display.
+#[cfg(windows)]
+fn check_driver_age() -> CheckOutcome {
+    let id = CheckId::DriverAge;
+    const BODY: &str = r#"
+try {
+  $classes = @('NET', 'MEDIA', 'SCSIADAPTER', 'HDC', 'DISPLAY')
+  $drivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+    Where-Object { $classes -contains $_.DeviceClass -and $_.DriverDate -and $_.DriverProviderName -notlike 'Microsoft*' })
+  foreach ($driver in ($drivers | Sort-Object DriverDate | Select-Object -First 12)) {
+    Emit 'DRV' @(
+      $driver.DeviceName,
+      $driver.DriverProviderName,
+      $driver.DriverDate.ToString('yyyy-MM-dd'),
+      [string]([math]::Floor(((Get-Date) - $driver.DriverDate).TotalDays)),
+      $driver.DeviceClass
+    )
+  }
+  Emit 'DRVOK' @([string]$drivers.Count)
+} catch { Emit 'DRVERR' @($_.Exception.Message) }
+"#;
+    let output = match run_powershell(&script(BODY), Duration::from_secs(60)) {
+        Ok(output) => output,
+        Err(error) => return failed(id, error),
+    };
+    let errors = report_errors(&output.stdout, "DRVERR");
+    if !report_completed(&output.stdout, "DRVOK") {
+        let detail = if errors.is_empty() {
+            output.failure_detail()
+        } else {
+            errors.join("; ")
+        };
+        return failed(id, format!("Could not list drivers: {detail}"));
+    }
+    let drivers: Vec<Vec<String>> = output
+        .stdout
+        .lines()
+        .filter_map(decode_line)
+        .filter(|(key, _)| *key == "DRV")
+        .map(|(_, fields)| fields)
+        .collect();
+
+    // Five years. Vendors do stop shipping updates for working hardware, so
+    // this is phrased as something to look at rather than as a fault: the
+    // check cannot tell a neglected driver from a finished one.
+    const OLD_DAYS: i64 = 1825;
+    let mut details: Vec<String> = drivers
+        .iter()
+        .map(|fields| {
+            let age = field(fields, 3).parse::<i64>().unwrap_or(0);
+            format!(
+                "{} · {} · {} · {}",
+                truncate(field(fields, 0), 60),
+                truncate(field(fields, 1), 30),
+                field(fields, 2),
+                human_duration(age.max(0) as f64 * 24.0)
+            )
+        })
+        .collect();
+    details.push(
+        "Microsoft's own drivers are left out: Windows dates all of them 2006 whatever version \
+         they are, so their age says nothing."
+            .to_owned(),
+    );
+    details.extend(errors);
+
+    let old: Vec<&Vec<String>> = drivers
+        .iter()
+        .filter(|fields| field(fields, 3).parse::<i64>().unwrap_or(0) > OLD_DAYS)
+        .collect();
+    let (status, summary) = if drivers.is_empty() {
+        (
+            CheckStatus::Pass,
+            "No third-party driver was found on the network, audio, storage or display devices."
+                .to_owned(),
+        )
+    } else if old.is_empty() {
+        (
+            CheckStatus::Pass,
+            format!(
+                "Every vendor driver is under five years old ({}).",
+                plural(drivers.len(), "driver")
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Warning,
+            format!(
+                "{} over five years old, including {}.",
+                plural(old.len(), "vendor driver"),
+                truncate(field(old[0], 0), 50)
+            ),
+        )
+    };
+    CheckOutcome {
+        id,
+        status,
+        summary,
+        details,
+    }
+}
+
+/// The GUID Windows gives the Power saver scheme. Fixed across every edition
+/// and every display language, which is the point: the scheme *name* is
+/// localised and matching on it fails on exactly the machines this check is
+/// most useful on.
+pub const POWER_SAVER_GUID: &str = "a1841308-3541-4fab-bc81-f71556f20b4a";
+
+/// Pull the GUID and the display name out of `powercfg /getactivescheme`.
+///
+/// The line reads, in English, `Power Scheme GUID: <guid>  (Balanced)`. Both
+/// halves are localised except the GUID, and an OEM scheme can carry any name
+/// at all, so the name is taken as whatever sits in the final parentheses and
+/// the GUID is found by shape rather than by position.
+pub fn parse_active_scheme(reported: &str) -> (String, String) {
+    let guid = reported
+        .split(|c: char| !c.is_ascii_hexdigit() && c != '-')
+        .find(|token| token.len() == 36 && token.matches('-').count() == 4)
+        .unwrap_or_default()
+        .to_owned();
+    let name = reported
+        .rfind('(')
+        .and_then(|open| {
+            let rest = &reported[open + 1..];
+            rest.rfind(')').map(|close| rest[..close].trim().to_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            if guid.is_empty() {
+                reported.trim().to_owned()
+            } else {
+                format!("Scheme {guid}")
+            }
+        });
+    (guid, name)
 }
 
 /// Keep the worst verdict seen so far. Needed because the drive check folds
@@ -1529,7 +2759,7 @@ try {
             dirty.join(", ")
         )
     } else if status == CheckStatus::Pass {
-        format!("{} fixed volume(s) are clean.", volumes.len())
+        format!("{} clean.", plural(volumes.len(), "fixed volume"))
     } else {
         "The dirty flag could not be read for every volume.".to_owned()
     };
@@ -1943,13 +3173,46 @@ No component store corruption detected.\r\n";
     }
 
     #[test]
+    fn reads_the_active_power_scheme_in_any_language() {
+        // Captured from a real Italian session during the UAT: the name is
+        // translated, the GUID is not, and an OEM scheme carries neither of
+        // the names this check used to look for.
+        let (guid, name) = parse_active_scheme(
+            "GUID combinazione risparmio energia: c99ca36e-be1c-4069-93bb-b53c78210ca2  (Prestazioni eccellenti)",
+        );
+        assert_eq!(guid, "c99ca36e-be1c-4069-93bb-b53c78210ca2");
+        assert_eq!(name, "Prestazioni eccellenti");
+
+        let (guid, name) = parse_active_scheme(
+            "Power Scheme GUID: a1841308-3541-4fab-bc81-f71556f20b4a  (Power saver)",
+        );
+        assert_eq!(guid, POWER_SAVER_GUID);
+        assert_eq!(name, "Power saver");
+
+        // Nothing recognisable must not panic and must not claim a GUID.
+        let (guid, name) = parse_active_scheme("powercfg said something else entirely");
+        assert!(guid.is_empty());
+        assert_eq!(name, "powercfg said something else entirely");
+    }
+
+    #[test]
     fn statuses_map_onto_the_health_vocabulary() {
-        assert!(CheckStatus::Pass.severity().is_some());
-        assert!(CheckStatus::Problem.severity().is_some());
-        // Neither of these is a statement about the machine, so neither gets a
-        // colour that would read as one.
-        assert!(CheckStatus::Skipped.severity().is_none());
-        assert!(CheckStatus::Error.severity().is_none());
-        assert_eq!(CheckId::ALL.len(), 9);
+        assert!(CheckStatus::Problem.is_finding());
+        assert!(CheckStatus::Warning.is_finding());
+        assert!(CheckStatus::NeedsAdmin.is_finding());
+        // A pass is not a finding, and neither is a check that did not run or
+        // could not finish -- those are reported, and coloured, but there is
+        // nothing in them for the user to act on.
+        assert!(!CheckStatus::Pass.is_finding());
+        assert!(!CheckStatus::Skipped.is_finding());
+        assert!(!CheckStatus::Error.is_finding());
+        // The count is asserted so that adding a variant without adding it to
+        // `ALL` -- which would silently stop running that check -- fails here
+        // rather than in the field.
+        assert_eq!(CheckId::ALL.len(), 18);
+        for id in CheckId::ALL {
+            assert!(!id.label().is_empty());
+            assert!(!id.explanation().is_empty());
+        }
     }
 }

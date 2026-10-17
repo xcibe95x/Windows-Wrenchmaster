@@ -218,17 +218,23 @@ Two refinements worth copying:
 
 ## 7. Comment style
 
-Comments explain **why**, and what was tried before. They never restate what
-the code does. Full sentences. Every public item gets a doc comment.
+Comments explain **why**, never what. Most code needs none.
+
+Write one only when a reader would otherwise change the code and break
+something: a non-obvious constraint, a threshold with a reason, a bug that
+came back. One or two lines. If it takes a paragraph, the code is wrong or
+the comment is an essay.
 
 ```rust
-// A fill narrower than the bar is tall cannot be drawn as a rounded shape --
-// the two end caps overlap and it renders as a dark smudge. Below that point
-// the reading becomes a dot at the start of the scale: honest about being
-// near zero, and visible.
+// A fill narrower than the bar is tall renders as a smudge: the end caps
+// overlap. Below that, show a dot instead.
 ```
 
-Not: `// clamp the fill width`.
+Not `// clamp the fill width` (restates the code), and not four lines of
+history on a one-line fix. Public items get a doc comment of one line unless
+the contract genuinely needs more.
+
+Prose costs the same tokens as code and is read less. Keep it short.
 
 ---
 
@@ -243,6 +249,11 @@ cargo test
 ```
 
 The tree is rustfmt-clean and warning-free. Keep it that way.
+
+**Keep the hand-back short.** A few lines: what changed, anything that is
+still broken or unverified, and what needs a decision. No feature tour, no
+restating the request, no summary of the summary. Detail belongs in the code
+and its comments, not in a report nobody asked for.
 
 **Compiling is not the bar for UI work.** A page can build perfectly and still
 be unusable — nine stacked cards, a button pushed off the edge by an unwrapped

@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    # Decide first, build second. A release build takes minutes and most
+    # pushes to main are not releases.
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml says $version"
+
+          # A tag that already exists means this version shipped, whatever the
+          # diff says: a revert, a rebuild or a second push of the same number
+          # must not try to release it again.
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "v$version is already tagged"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Highest version released so far, by semver rather than by tag date:
+          # tags can be pushed out of order.
+          previous=$(git tag --list 'v*' | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$previous" ]; then
+            echo "no previous tag; first release"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          highest=$(printf '%s\n%s\n' "$previous" "$version" | sort -V | tail -1)
+          if [ "$highest" = "$version" ] && [ "$previous" != "$version" ]; then
+            echo "$version is newer than $previous"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$version is not newer than $previous"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The same gates as CI, repeated here on purpose: a release must not be
+      # able to ship because someone re-ran a workflow or pushed past a red
+      # build.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build sensor helper
+        run: >
+          dotnet publish sensor-helper/Wrenchmaster.Sensors.csproj
+          --configuration Release --runtime win-x64 --self-contained true
+          --output target/release/sensors
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The icon and version metadata are embedded by build.rs through
+      # winresource. If the resource compiler is missing on the runner it only
+      # warns, and an unsigned admin tool with a blank icon is not worth
+      # shipping, so the absence is treated as a failure here.
+      - name: Verify the executable is dressed
+        shell: pwsh
+        run: |
+          $exe = 'target/release/wrenchmaster.exe'
+          Add-Type -AssemblyName System.Drawing
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path $exe))
+          if (-not $icon) { throw 'no icon embedded in the executable' }
+          $info = (Get-Item $exe).VersionInfo
+          if (-not $info.ProductName) { throw 'no version metadata in the executable' }
+          "icon $($icon.Width)x$($icon.Height), product '$($info.ProductName)'"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $staging = 'dist/Windows-Wrenchmaster'
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item 'target/release/wrenchmaster.exe' $staging
+          Copy-Item 'target/release/sensors' $staging -Recurse -ErrorAction SilentlyContinue
+          Copy-Item 'README.md', 'assets/Inter-OFL.txt' $staging -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$staging/*" -DestinationPath 'dist/Windows-Wrenchmaster-${{ needs.version.outputs.version }}.zip'
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Windows Wrenchmaster ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/Windows-Wrenchmaster-${{ needs.version.outputs.version }}.zip
+            target/release/wrenchmaster.exe

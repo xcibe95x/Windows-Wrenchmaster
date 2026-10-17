@@ -72,6 +72,16 @@ fn admin_console_destructive(name: &str, what: &str, cmd: &str) -> Action {
     }
 }
 
+/// A one-off "open this Windows console" action, for pages that offer a tool
+/// beside a finding rather than from a list.
+///
+/// It goes through `Action` rather than calling `shell_open` directly so that
+/// a failed launch is reported the same way everywhere, and so a target that
+/// later turns out to need confirming has one place to gain it.
+pub fn shell_action(name: &str, target: &str) -> Action {
+    shell(name, "Opened from a diagnosis finding.", target)
+}
+
 fn shell(name: &str, what: &str, target: &str) -> Action {
     action(name, what, false, Run::Shell(target.to_string()))
 }
